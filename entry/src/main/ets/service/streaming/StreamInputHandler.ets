@@ -1,0 +1,838 @@
+/*
+ * Moonlight for HarmonyOS
+ * Copyright (C) 2024-2025 Moonlight/AlkaidLab
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ */
+
+/**
+ * 串流页面输入处理器
+ *
+ * 封装键盘、鼠标、滚轮、音量键、按键拦截器等所有输入处理逻辑，
+ * 从 StreamPage 中解耦以降低单文件复杂度。
+ */
+import { display, window } from '@kit.ArkUI';
+import { common } from '@kit.AbilityKit';
+import { StreamViewModel } from '../../viewmodel/StreamViewModel';
+import { GamepadManager } from '../input/GamepadManager';
+import { ToastQueue } from '../../utils/ToastQueue';
+
+import {
+  MoonBridge,
+  BUTTON_ACTION_PRESS,
+  BUTTON_ACTION_RELEASE,
+  BUTTON_LEFT,
+  BUTTON_MIDDLE,
+  BUTTON_RIGHT,
+  BUTTON_X1,
+  BUTTON_X2,
+  KEY_ACTION_DOWN,
+  KEY_ACTION_UP,
+  MODIFIER_SHIFT,
+  MODIFIER_CTRL,
+  MODIFIER_ALT,
+  MODIFIER_META
+} from './MoonBridge';
+import { KeyboardTranslator } from '../input/KeyboardTranslator';
+import { InputInterceptorService, MouseInterceptorService } from '../input/InputInterceptorService';
+import { Logger } from '../../common/Logger';
+import { FileLog } from '../networking/FileLog';
+
+export class StreamInputHandler {
+  // ── 键盘修饰键状态追踪（位掩码：Shift=0x01, Ctrl=0x02, Alt=0x04, Meta=0x08）──
+  private modifierFlags: number = 0;
+  // ── 诊断：键盘三条道各自收到的按键数（主路=按键拦截器，窗口=ArkUI onKeyEvent）
+  //    数字停滞即说明那条道不再收键，用于定位"打字能进、其他键哑" ──
+  private interceptedKeyCount: number = 0;
+  private arkUiKeyCount: number = 0;
+  // ── 当前通过 ArkUI onKeyEvent 按下的 VK 键集合（用于焦点丢失时释放残留键）──
+  private activeVkKeys: Set<number> = new Set<number>();
+
+  // ── 鼠标拦截器（绕过 ArkUI 帧率限制，全速鼠标轮询）──
+  private mouseInterceptorActive: boolean = false;
+
+  // ── XComponent 实际渲染尺寸（vp，用于绝对模式坐标归一化）──
+  private viewWidthVp: number = 0;
+  private viewHeightVp: number = 0;
+
+  // ── 屏幕物理尺寸（px，用于相对模式边缘检测和 configure 传参）──
+  private screenWidthPx: number = 1080;
+  private screenHeightPx: number = 2400;
+
+  // ── ESC 双击检测（2in1 物理键盘用可配置按键代替返回手势打开串流菜单）──
+  private lastEscUpTime: number = 0;
+  private hasShownEscHint: boolean = false;
+  private static readonly ESC_DOUBLE_TAP_INTERVAL: number = 500; // ms
+  private static readonly KEYCODE_ESCAPE: number = 2070;
+  /** 当前用于打开串流菜单的按键码（可通过设置替换为 F1/F12/~ 等） */
+  private menuKeyCode: number = 2070; // 默认 ESC
+  /** ESC 菜单功能是否启用（设置页开关） */
+  private escMenuEnabled: boolean = true;
+  private onShowStreamMenu: (() => void) | null = null;
+
+  // ── 应用音频音量回退（C++ 层无法回注音量键时的应用级音量补偿）──
+  private appVolume: number = 1.0;
+  private preMuteVolume: number = 1.0;
+  private static readonly VOLUME_STEP: number = 0.1;
+
+  // ── 已知手柄设备 ID 缓存（运行时通过收到手柄按键事件学习） ──
+  private knownGamepadDeviceIds: Set<number> = new Set<number>();
+
+  // ── 外部依赖 ──
+  private viewModel: StreamViewModel | null = null;
+  private gamepadManager: GamepadManager | null = null;
+
+
+
+  /**
+   * 初始化依赖项
+   */
+  initialize(viewModel: StreamViewModel, gamepadManager: GamepadManager): void {
+    this.viewModel = viewModel;
+    this.gamepadManager = gamepadManager;
+  }
+
+  /**
+   * 设置打开串流菜单的回调（由 StreamPage 注入）
+   */
+  setOnShowStreamMenu(callback: () => void): void {
+    this.onShowStreamMenu = callback;
+  }
+
+  /**
+   * 设置用于打开串流菜单的按键（由设置页配置）
+   * @param keyName 按键名称: 'ESC' | 'F1' | 'F12' | '~'
+   */
+  setMenuKey(keyName: string): void {
+    switch (keyName) {
+      case 'F1':
+        this.menuKeyCode = 2090;
+        break;
+      case 'F12':
+        this.menuKeyCode = 2101;
+        break;
+      case '~':
+        this.menuKeyCode = 2056;
+        break;
+      default: // 'ESC'
+        this.menuKeyCode = StreamInputHandler.KEYCODE_ESCAPE;
+        break;
+    }
+  }
+
+  /**
+   * 设置 ESC 菜单功能是否启用
+   */
+  setEscMenuEnabled(enabled: boolean): void {
+    this.escMenuEnabled = enabled;
+  }
+
+  /**
+   * 重置所有输入状态（串流停止时调用）
+   */
+  resetState(): void {
+    this.releaseAllKeys();
+    // 对账记录不跨串流残留：新串流主机端状态全新，旧记录无意义
+    this.releasedVkKeys.clear();
+    this.modifierFlags = 0;
+    this.lastEscUpTime = 0;
+    this.hasShownEscHint = false;
+    this.knownGamepadDeviceIds.clear();
+    this.stopMouseInterceptor();
+  }
+
+  // ── Windows 修饰键 VK 码（用于失焦时补发 KEY_UP，防止主机端修饰键卡住）──
+  private static readonly MODIFIER_VK_CODES: number[] = [
+    0xA0, 0xA1, // VK_LSHIFT, VK_RSHIFT
+    0xA2, 0xA3, // VK_LCONTROL, VK_RCONTROL
+    0xA4, 0xA5, // VK_LMENU, VK_RMENU (Alt)
+    0x5B, 0x5C  // VK_LWIN, VK_RWIN
+  ];
+
+  // ── 焦点恢复对账：修饰键 HarmonyOS KeyCode ↔ Windows VK（下标一一对应）──
+  // ALT_L/R, SHIFT_L/R, CTRL_L/R, META_L/R
+  private static readonly RECONCILE_KEY_CODES: number[] = [
+    2045, 2046, 2047, 2048, 2072, 2073, 2076, 2077
+  ];
+  private static readonly RECONCILE_VK_CODES: number[] = [
+    0xA4, 0xA5, 0xA0, 0xA1, 0xA2, 0xA3, 0x5B, 0x5C
+  ];
+
+  // ── 失焦释放时被强制抬起的普通键，恢复焦点时需复核是否仍物理按下 ──
+  private releasedVkKeys: Set<number> = new Set<number>();
+
+  /**
+   * 释放所有按下但未释放的键（含修饰键），并清空本地修饰键状态。
+   *
+   * 调用时机：
+   * - onBackPress 弹出对话框（焦点丢失）
+   * - 应用退后台 / 窗口失焦（Alt+Tab 切走）
+   * - 双击菜单键打开串流菜单
+   * - 串流停止 resetState
+   *
+   * 对齐 Android Game.onWindowFocusChanged → KeyboardInputHandler.clearModifierState()：
+   * 切后台期间 KEY_UP 不会送达应用，若不清除，Windows 端 Alt/Ctrl 会永久按下，
+   * 导致返回串流后无法打字、Blender 鼠标选择异常（Alt+左键=旋转视图）。
+   */
+  releaseAllKeys(): void {
+    const session = this.viewModel?.getSession();
+    if (session) {
+      // 1. 释放所有追踪到的按键，并补齐 8 个 Windows 修饰键，兜底处理
+      //    修饰键状态与按键追踪状态不一致的边缘情况。
+      //    对未按下的键补发 KEY_UP 在 Windows 端是安全的 no-op。
+      const keysToRelease = new Set<number>(this.activeVkKeys);
+      StreamInputHandler.MODIFIER_VK_CODES.forEach((vkCode: number) => {
+        keysToRelease.add(vkCode);
+      });
+      keysToRelease.forEach((vkCode: number) => {
+        session.sendKeyboardInput(vkCode, KEY_ACTION_UP, 0);
+      });
+    }
+    // 累积记录被强制抬起的键（失焦与退后台可能连续触发，第二次
+    // activeVkKeys 已为空，覆盖赋值会丢掉记录），由 reconcileKeyState 消费后清空
+    this.activeVkKeys.forEach((vkCode: number) => {
+      this.releasedVkKeys.add(vkCode);
+    });
+    this.activeVkKeys.clear();
+    // 2. 清空本地修饰键位掩码，防止后续按键被错误拼上残留的 Alt/Ctrl 位
+    this.modifierFlags = 0;
+  }
+
+  /**
+   * 焦点恢复时对账按键状态
+   *
+   * 失焦边界 releaseAllKeys() 把主机端按键全部抬起，但用户可能仍物理按着
+   * 部分键（典型：Alt+Tab 的 Alt、游戏中按住的方向键）。事件通道在失焦期间
+   * 收不到任何信息，无法凭事件推断，因此通过 OH_Input_GetKeyState 查询系统
+   * 权威按键状态，与本地追踪做差量同步：
+   *   - 物理按下但本地认为松开 → 补发 KEY_DOWN（用户还按着，主机端应恢复）
+   *   - 物理松开但本地认为按下 → 补发 KEY_UP（兜底 UP 被系统吞掉的情况）
+   *
+   * 低版本设备无该 API 时静默跳过（保持 releaseAllKeys 后的干净状态）。
+   */
+  reconcileKeyState(): void {
+    // 未连接（如后台断连等待重连）时不消费记录，
+    // 留给重连完成后窗口焦点恢复时再对账
+    if (!this.viewModel?.isConnected) return;
+    const session = this.viewModel.getSession();
+    if (!session) return;
+
+    // 1. 组装待查询的 HarmonyOS 键码：8 个修饰键 + 失焦时被强制释放的普通键
+    //    （修饰键已在 RECONCILE 列表中，跳过避免重复查询）
+    const harmonyCodes: number[] = StreamInputHandler.RECONCILE_KEY_CODES.slice(0);
+    const vkCodes: number[] = StreamInputHandler.RECONCILE_VK_CODES.slice(0);
+    this.releasedVkKeys.forEach((vkCode: number) => {
+      if (StreamInputHandler.RECONCILE_VK_CODES.indexOf(vkCode) >= 0) return;
+      const harmony = KeyboardTranslator.reverseTranslate(vkCode);
+      if (harmony > 0) {
+        harmonyCodes.push(harmony);
+        vkCodes.push(vkCode);
+      }
+    });
+
+    // 2. 查询真实物理状态（null = API 不可用，维持现状）
+    const states = InputInterceptorService.getInstance().queryKeyStates(harmonyCodes);
+    if (states === null || states.length !== harmonyCodes.length) return;
+
+    // 3. 差量同步：只对与本地状态不一致的键补发事件
+    let resynced = 0;
+    for (let i = 0; i < vkCodes.length; i++) {
+      if (states[i] < 0) continue; // 单键查询失败，保守跳过
+      const vkCode = vkCodes[i];
+      const pressed = states[i] === 1;
+      if (pressed === this.activeVkKeys.has(vkCode)) continue;
+      this.updateModifierFlags(vkCode, pressed);
+      session.sendKeyboardInput(vkCode, pressed ? KEY_ACTION_DOWN : KEY_ACTION_UP, this.modifierFlags);
+      if (pressed) {
+        this.activeVkKeys.add(vkCode);
+      } else {
+        this.activeVkKeys.delete(vkCode);
+      }
+      resynced++;
+    }
+    this.releasedVkKeys.clear();
+    if (resynced > 0) {
+      Logger.info('StreamInputHandler', `[INPUT] 焦点恢复对账: ${resynced} 个按键状态已重新同步`);
+    }
+  }
+
+  // ==================== 鼠标高速轮询 ====================
+
+  /**
+   * 启动鼠标高速轮询
+   *
+   * 优先尝试 C++ 层 OH_Input_AddMouseEventMonitor（需要 INPUT_MONITORING 权限），
+   * 以硬件轮询率直接调用 moonlight API。
+   *
+   * @param viewWidth 视图宽度 (vp)
+   * @param viewHeight 视图高度 (vp)
+   * @param windowId 主窗口 ID
+   * @param isFullscreen 是否处于全屏模式
+   * @returns true 表示 C++ Monitor 已启动（不需要 keepalive），
+   *          false 表示应启用 keepalive，由 ArkUI 处理鼠标事件
+   */
+  startMouseInterceptor(viewWidth: number, viewHeight: number,
+                        windowId: number, isFullscreen: boolean): boolean {
+    const mouseInterceptor = MouseInterceptorService.getInstance();
+    mouseInterceptor.stop();
+    this.mouseInterceptorActive = false;
+
+    // 保存 XComponent 实际尺寸，供 ArkUI 回退路径绝对模式使用
+    this.viewWidthVp = viewWidth;
+    this.viewHeightVp = viewHeight;
+
+    // 获取屏幕物理尺寸
+    let screenWidthPx = 1080;
+    let screenHeightPx = 2400;
+    try {
+      const displayInfo = display.getDefaultDisplaySync();
+      screenWidthPx = displayInfo.width;
+      screenHeightPx = displayInfo.height;
+    } catch (_) {}
+
+    // 保存屏幕尺寸供后续 configure 调用使用
+    this.screenWidthPx = screenWidthPx;
+    this.screenHeightPx = screenHeightPx;
+
+    // 读取游戏鼠标模式设置
+    const relativeMode = this.viewModel?.inputSettings?.gameMouseMode ?? false;
+
+    // API 22+ 全屏窗口使用系统光标锁定。相对模式锁定后坐标保持不变，
+    // 必须由 ArkUI rawDelta 处理移动，不能再用 C++ Monitor 计算坐标差。
+    let cursorLocked = false;
+    if (isFullscreen && windowId >= 0 && mouseInterceptor.isCursorLockAvailable()) {
+      const lockResult = mouseInterceptor.lockCursor(windowId, !relativeMode);
+      cursorLocked = lockResult === 0;
+      if (!cursorLocked) {
+        Logger.info('StreamInputHandler', `StreamInputHandler: 光标锁定不可用 (${lockResult})，保留原有鼠标处理`);
+      }
+    }
+    if (relativeMode && cursorLocked) {
+      Logger.info('StreamInputHandler', 'StreamInputHandler: 游戏鼠标模式已锁定光标，使用 ArkUI rawDelta');
+      return false;
+    }
+
+    // 初始使用屏幕尺寸（全屏时完全正确），窗口模式下异步获取实际窗口矩形更新
+    mouseInterceptor.configure(0, 0, screenWidthPx, screenHeightPx,
+                                screenWidthPx, screenHeightPx, relativeMode);
+
+    const result = mouseInterceptor.start();
+    if (result === 0) {
+      this.mouseInterceptorActive = true;
+      const modeLabel = relativeMode ? '相对/游戏' : '绝对/桌面';
+      Logger.info('StreamInputHandler', `StreamInputHandler: C++ 鼠标 Monitor 已启动 (${screenWidthPx}x${screenHeightPx}px, ${modeLabel})`);
+
+      // 异步获取实际窗口矩形（窗口模式下与屏幕尺寸不同）
+      this.fetchAndUpdateWindowRect();
+      return true;
+    }
+
+    this.mouseInterceptorActive = false;
+    Logger.info('StreamInputHandler', `StreamInputHandler: C++ Monitor 不可用 (${result})，将使用 keepalive 动画保持 .onMouse 全速`);
+    return false;
+  }
+
+  /**
+   * 更新 XComponent 实际渲染尺寸（由 onAreaChange 回调触发）
+   * 窗口模式下 XComponent 为 '100%'，实际 vp 尺寸需从 onAreaChange 获取
+   */
+  updateXComponentActualSize(widthVp: number, heightVp: number): void {
+    this.viewWidthVp = widthVp;
+    this.viewHeightVp = heightVp;
+  }
+
+  /**
+   * 更新 XComponent 在屏幕上的精确位置（由 onAreaChange 回调触发）
+   * C++ 鼠标 Monitor 使用窗口矩形映射，onAreaChange 时重新获取窗口矩形
+   */
+  updateXComponentScreenPosition(screenX: number, screenY: number): void {
+    // 窗口大小或位置可能变化，重新获取窗口矩形
+    if (this.mouseInterceptorActive) {
+      this.fetchAndUpdateWindowRect();
+    }
+  }
+
+  /**
+   * 异步获取窗口矩形并更新到 C++ 层
+   * 全屏模式下窗口矩形=屏幕尺寸（已在初始化时设置），
+   * 窗口模式下获取实际窗口位置和尺寸
+   */
+  private fetchAndUpdateWindowRect(): void {
+    try {
+      const context = getContext() as common.UIAbilityContext;
+      window.getLastWindow(context).then((win: window.Window) => {
+        const rect = win.getWindowProperties().windowRect;
+        if (rect && this.mouseInterceptorActive) {
+          const relativeMode = this.viewModel?.inputSettings?.gameMouseMode ?? false;
+          MouseInterceptorService.getInstance().configure(
+            rect.left, rect.top, rect.width, rect.height,
+            this.screenWidthPx, this.screenHeightPx, relativeMode
+          );
+          Logger.info('StreamInputHandler', `StreamInputHandler: 窗口矩形已更新 (${rect.left},${rect.top},${rect.width}x${rect.height})`);
+        }
+      }).catch((err: Error) => {
+        Logger.warn('StreamInputHandler', `StreamInputHandler: 获取窗口矩形失败: ${err?.message}`);
+      });
+    } catch (_) {}
+  }
+
+  /**
+   * 停止鼠标高速轮询
+   */
+  stopMouseInterceptor(): void {
+    MouseInterceptorService.getInstance().stop();
+    this.mouseInterceptorActive = false;
+  }
+
+  /**
+   * 查询 C++ Monitor 是否激活
+   */
+  isMouseInterceptorActive(): boolean {
+    return this.mouseInterceptorActive;
+  }
+
+  // ==================== 鼠标输入 ====================
+
+  /**
+   * 处理物理鼠标事件（挂载在 XComponent 上以获取原生 Surface 级事件频率）
+   * 当鼠标拦截器启用时，鼠标事件由 C++ 层直接处理，此方法不再执行。
+   */
+  handleMouseEvent(event: MouseEvent): void {
+    if (!this.viewModel?.isConnected) return;
+
+    // 阻止事件继续传递，避免触发系统默认行为（无论 Monitor 是否启用都要调用）
+    event.stopPropagation();
+
+    // Monitor 启用时鼠标事件已由 C++ 层直接处理，跳过 ArkTS 处理避免重复
+    if (this.mouseInterceptorActive) return;
+
+    if (event.action === MouseAction.Move) {
+      const relativeMode = this.viewModel?.inputSettings?.gameMouseMode ?? false;
+      if (relativeMode) {
+        // rawDelta 是鼠标硬件上报的原始位移，不是 vp/px，直接转发给远端。
+        const dx = event.rawDeltaX ?? 0;
+        const dy = event.rawDeltaY ?? 0;
+        if (dx !== 0 || dy !== 0) {
+          MoonBridge.sendMouseMove(Math.round(dx), Math.round(dy));
+        }
+      } else {
+        // 绝对模式：发送坐标位置
+        // event.x/y 为相对于 XComponent 的 vp 坐标，用 XComponent 尺寸作为参考域
+        MoonBridge.sendMousePosition(
+          Math.round(event.x), Math.round(event.y),
+          this.viewWidthVp, this.viewHeightVp
+        );
+      }
+    } else if (event.action === MouseAction.Press || event.action === MouseAction.Release) {
+      const button = this.mapMouseButton(event.button);
+      if (button > 0) {
+        const action = event.action === MouseAction.Press
+          ? BUTTON_ACTION_PRESS : BUTTON_ACTION_RELEASE;
+        MoonBridge.sendMouseButton(action, button);
+      }
+    }
+  }
+
+  // ==================== 滚轮输入 ====================
+
+  /**
+   * 处理鼠标滚轮事件（挂载在 XComponent 上以确保 native surface 能接收轴事件）
+   */
+  handleAxisEvent(event: AxisEvent): void {
+    if (!this.viewModel?.isConnected) return;
+
+    const vertical = event.getVerticalAxisValue();
+    const horizontal = event.getHorizontalAxisValue();
+
+    // scrollStep: 系统「鼠标滚轮速度」设置的放大倍数（文档：上报数值受系统放大倍数影响）
+    // 对于串流，我们模拟物理鼠标→应发送原始每格数据，让远端 PC 应用自己的滚轮速度
+    // 因此需要除以 scrollStep 归一化掉本地放大倍数
+    const scrollStep = (event.scrollStep && event.scrollStep > 0) ? event.scrollStep : 1;
+
+    // HarmonyOS 滚轮：向前滚动（远离用户）= 负值，向后滚动（靠近用户）= 正值
+    // Moonlight sendMouseHighResScroll：正值 = 向上滚动（远离用户）
+    // 因此需要取反
+    // 归一化后的值 / scrollStep 为每格原始值，× 8 = 120 units（Windows WHEEL_DELTA）
+    if (vertical !== 0) {
+      const scrollAmount = Math.round(-vertical / scrollStep * 8);
+      MoonBridge.sendMouseHighResScroll(scrollAmount);
+    }
+
+    // 水平滚动（同样取反、归一化）
+    if (horizontal !== 0) {
+      MoonBridge.sendMouseHighResHScroll(Math.round(-horizontal / scrollStep * 8));
+    }
+  }
+
+  // ==================== 键盘输入 ====================
+
+  /**
+   * 处理键盘/手柄按键事件
+   *
+   * 区分手柄按键与键盘按键：
+   * - 手柄按键（传统 InputKit 19-22/96-110，GCK 2300-2320）→ GamepadManager
+   * - 键盘按键（2000-2120）→ 翻译为 Windows VK 码后通过 sendKeyboardInput 发送
+   *
+   * @param event 按键事件
+   * @returns 是否已处理该事件
+   */
+  handleKeyEvent(event: KeyEvent): boolean {
+    const keyCode = event.keyCode;
+    // 诊断：窗口按键通道(ArkUI)确实在收键
+    this.arkUiKeyCount++;
+    if (this.arkUiKeyCount === 1) {
+      FileLog.d('KB-DIAG', `窗口按键通道收到首个按键 keyCode=${keyCode}`);
+    }
+    const isGamepadKey = KeyboardTranslator.isGamepadKey(keyCode);
+
+    if (!this.viewModel?.isConnected) {
+      // 即使未连接，也要拦截手柄按键，防止触发系统导航
+      return isGamepadKey;
+    }
+
+    if (isGamepadKey) {
+      // 手柄按键 → 转发给 GamepadManager
+      const deviceId = event.deviceId ?? 0;
+      // 学习该 deviceId 为手柄设备（用于后续 DPad 方向键过滤）
+      if (deviceId > 0) {
+        this.knownGamepadDeviceIds.add(deviceId);
+      }
+      this.gamepadManager?.handleKeyEvent(
+        deviceId,
+        keyCode,
+        event.type === KeyType.Down
+      );
+      return true;
+    }
+
+    // D-pad 方向键 (2012-2015) - 通过 deviceId 区分键盘方向键和手柄 DPad
+    // GCK 手柄活跃时：手柄 DPad 已由 GCK Axis 处理，此处 KeyEvent 需丢弃避免双发
+    // 键盘方向键正常透传
+    if (keyCode >= 2012 && keyCode <= 2015 && this.gamepadManager?.hasActiveGcGamepad()) {
+      const deviceId = event.deviceId ?? 0;
+      if (this.knownGamepadDeviceIds.has(deviceId)) {
+        return true; // 已知手柄设备，丢弃
+      }
+    }
+
+    // 菜单键双击检测（可配置按键，默认 ESC，2in1 物理键盘用于打开串流菜单）
+    if (this.escMenuEnabled && keyCode === this.menuKeyCode) {
+      if (this.checkEscDoubleTap(event.type === KeyType.Down)) {
+        return true; // 事件被消费（第二次按键）
+      }
+      // 第一次或超时 → fall through 正常透传给主机
+    }
+
+    // 键盘按键 → 翻译为 Windows VK 码并发送
+    if (KeyboardTranslator.isKeyboardKey(keyCode)) {
+      const vkCode = KeyboardTranslator.translate(keyCode);
+      if (vkCode > 0) {
+        this.updateModifierFlags(vkCode, event.type === KeyType.Down);
+        const session = this.viewModel?.getSession();
+        if (session) {
+          const keyAction = event.type === KeyType.Down ? KEY_ACTION_DOWN : KEY_ACTION_UP;
+          session.sendKeyboardInput(vkCode, keyAction, this.modifierFlags);
+          // 跟踪按下的键，便于焦点丢失时释放
+          if (event.type === KeyType.Down) {
+            this.activeVkKeys.add(vkCode);
+          } else {
+            this.activeVkKeys.delete(vkCode);
+          }
+        }
+      }
+      return true;
+    }
+
+    // 未识别的按键，不拦截
+    return false;
+  }
+
+  // ==================== 按键拦截器 ====================
+
+  /** 诊断：主路(按键直通)是否仍被原生层认为生效 */
+  isKeyInterceptorAlive(): boolean {
+    return InputInterceptorService.getInstance().isActive();
+  }
+
+  /** 诊断：主路累计收键数 */
+  getInterceptedKeyCount(): number {
+    return this.interceptedKeyCount;
+  }
+
+  /** 诊断：窗口按键通道累计收键数 */
+  getArkUiKeyCount(): number {
+    return this.arkUiKeyCount;
+  }
+
+  /**
+   * 启动按键事件拦截器
+   * 拦截被系统劫持的手柄按键和特殊键盘按键，转发给 GamepadManager / StreamingSession 处理
+   */
+  startKeyInterceptor(): boolean {
+    // 诊断：起流时清零，便于按"本次串流"读键盘时间线
+    this.interceptedKeyCount = 0;
+    this.arkUiKeyCount = 0;
+    const result = InputInterceptorService.getInstance().start((event) => {
+      if (!this.viewModel?.isConnected) {
+        return;
+      }
+      // 诊断：主路确实在收键（计数停滞 + 状态"在"= 原生订阅静默失效）
+      this.interceptedKeyCount++;
+      if (this.interceptedKeyCount === 1) {
+        FileLog.d('KB-DIAG', `主路(按键直通)收到首个按键 keyCode=${event.keyCode} action=${event.action}`);
+      }
+      const keyCode = event.keyCode;
+      // action: 1=KEY_DOWN, 2=KEY_UP
+      const isPressed = event.action === 1;
+
+      // 1. 手柄按键范围 (2300-2320 GC Kit / 110 标准 Mode) - 转发给 GamepadManager
+      if ((keyCode >= 2300 && keyCode <= 2320) || keyCode === 110) {
+        // 学习该 deviceId 为手柄设备（用于后续 DPad 方向键过滤）
+        const deviceId = event.deviceId ?? -1;
+        if (deviceId > 0) {
+          this.knownGamepadDeviceIds.add(deviceId);
+        }
+        this.gamepadManager?.handleKeyEvent(0, keyCode, isPressed);
+        return;
+      }
+
+      // 2. D-pad 方向键 (2012-2015) - 通过 deviceId 区分键盘方向键和手柄 DPad
+      //    GCK 手柄活跃时：已知手柄 deviceId 的事件丢弃（GCK Axis 已处理），
+      //    键盘方向键（deviceId 不在已知手柄集合中）正常透传
+      if (keyCode >= 2012 && keyCode <= 2015 && this.gamepadManager?.hasActiveGcGamepad()) {
+        const deviceId = event.deviceId ?? -1;
+        if (deviceId >= 0 && this.knownGamepadDeviceIds.has(deviceId)) {
+          return; // 已知手柄设备，丢弃
+        }
+        // deviceId 未知或不属于手柄 → fall through 当键盘方向键处理
+      }
+
+      // 3. 音量键 (16=VOLUME_UP, 17=VOLUME_DOWN, 22=VOLUME_MUTE)
+      //    C++ 层已优先尝试回注到系统；到达这里说明回注失败，用应用级音量补偿
+      if (keyCode === 16 || keyCode === 17 || keyCode === 22) {
+        if (isPressed) {
+          this.handleVolumeKey(keyCode);
+        }
+        return;
+      }
+
+      // 3.5 菜单键双击检测（同 handleKeyEvent 中的逻辑，拦截器路径也需要处理）
+      if (this.escMenuEnabled && keyCode === this.menuKeyCode) {
+        if (this.checkEscDoubleTap(isPressed)) {
+          return; // 事件被消费（第二次按键）
+        }
+        // 第一次或超时 → fall through 正常透传给主机
+      }
+
+      // 4. 键盘按键（2000-2120）— 翻译为 Windows VK 码后发送
+      if (KeyboardTranslator.isKeyboardKey(keyCode)) {
+        const vkCode = KeyboardTranslator.translate(keyCode);
+        if (vkCode > 0) {
+          this.updateModifierFlags(vkCode, isPressed);
+          const session = this.viewModel?.getSession();
+          if (session) {
+            const keyAction = isPressed ? KEY_ACTION_DOWN : KEY_ACTION_UP;
+            session.sendKeyboardInput(vkCode, keyAction, this.modifierFlags);
+            // 拦截器路径同样需要跟踪按键，否则失焦时无法补发普通键 KEY_UP
+            if (isPressed) {
+              this.activeVkKeys.add(vkCode);
+            } else {
+              this.activeVkKeys.delete(vkCode);
+            }
+          }
+        }
+        return;
+      }
+
+      // 5. 容易被系统劫持的特殊键盘按键 - 转发到主机
+      //    Home(1), Back(2), 多任务(3),
+      //    媒体键: Play/Pause(10), Stop(11), Next(12), Previous(13)
+      const SYSTEM_HIJACKED_KEYS: Set<number> = new Set([
+        1, 2, 3,                   // Home, Back, Recent
+        10, 11, 12, 13             // Media keys
+      ]);
+
+      if (SYSTEM_HIJACKED_KEYS.has(keyCode)) {
+        const session = this.viewModel?.getSession();
+        if (session) {
+          // HarmonyOS keyCode -> Windows VK 映射
+          const vkCode = this.mapSystemKeyToVK(keyCode);
+          if (vkCode > 0) {
+            const keyAction = isPressed ? 0x03 : 0x04; // KEY_DOWN : KEY_UP
+            session.sendKeyboardInput(vkCode, keyAction, this.modifierFlags);
+            if (isPressed) {
+              this.activeVkKeys.add(vkCode);
+            } else {
+              this.activeVkKeys.delete(vkCode);
+            }
+          }
+        }
+      }
+    });
+    if (result !== 0) {
+      Logger.warn('StreamInputHandler', `StreamPage: 按键拦截器启动失败 (${result})，手柄 Home 键可能被系统劫持`);
+      ToastQueue.show({
+        message: '按键反劫持启动失败：蓝牙手柄 Home 键可能导致退出（需系统级签名）',
+        duration: 3500
+      });
+      return false;
+    }
+    return true;
+  }
+
+  // ==================== 映射工具 ====================
+
+  /**
+   * 将 HarmonyOS 系统按键码映射到 Windows 虚拟键码
+   */
+  private mapSystemKeyToVK(keyCode: number): number {
+    switch (keyCode) {
+      case 1: return 0; // Home - 不转发（避免触发 Windows 开始菜单）
+      case 2: return 0x1B; // Back → VK_ESCAPE
+      case 3: return 0; // Recent/多任务 - 不转发
+      case 10: return 0xB3; // Media Play/Pause → VK_MEDIA_PLAY_PAUSE
+      case 11: return 0xB2; // Media Stop → VK_MEDIA_STOP
+      case 12: return 0xB0; // Media Next → VK_MEDIA_NEXT_TRACK
+      case 13: return 0xB1; // Media Previous → VK_MEDIA_PREV_TRACK
+      default: return 0;
+    }
+  }
+
+  /**
+   * 将 HarmonyOS MouseButton 映射到 MoonBridge 鼠标按钮常量
+   */
+  private mapMouseButton(button: MouseButton): number {
+    switch (button) {
+      case MouseButton.Left: return BUTTON_LEFT;       // 0x01
+      case MouseButton.Middle: return BUTTON_MIDDLE;   // 0x02
+      case MouseButton.Right: return BUTTON_RIGHT;     // 0x03
+      case MouseButton.Back:
+        return this.viewModel?.inputSettings?.mouseNavButtons ? BUTTON_X1 : 0;
+      case MouseButton.Forward:
+        return this.viewModel?.inputSettings?.mouseNavButtons ? BUTTON_X2 : 0;
+      default: return 0;
+    }
+  }
+
+  /**
+   * 根据 Windows VK 码更新修饰键状态位掩码
+   * 参照 Android 版 Game.java handleSpecialKeys() 的实现
+   *
+   * @param vkCode Windows 虚拟键码
+   * @param isDown 是否按下
+   */
+  private updateModifierFlags(vkCode: number, isDown: boolean): void {
+    let mask = 0;
+    switch (vkCode) {
+      case 0xA0: // VK_LSHIFT
+      case 0xA1: // VK_RSHIFT
+        mask = MODIFIER_SHIFT;
+        break;
+      case 0xA2: // VK_LCONTROL
+      case 0xA3: // VK_RCONTROL
+        mask = MODIFIER_CTRL;
+        break;
+      case 0xA4: // VK_LMENU (Alt Left)
+      case 0xA5: // VK_RMENU (Alt Right)
+        mask = MODIFIER_ALT;
+        break;
+      case 0x5B: // VK_LWIN
+      case 0x5C: // VK_RWIN
+        mask = MODIFIER_META;
+        break;
+    }
+    if (mask !== 0) {
+      if (isDown) {
+        this.modifierFlags |= mask;
+      } else {
+        this.modifierFlags &= ~mask;
+      }
+    }
+  }
+
+  // ==================== 菜单键双击检测 ====================
+
+  /**
+   * 菜单键双击检测（2in1 设备通过物理键盘可配置按键打开串流菜单）
+   *
+   * 参照 Android 版 Game.java 的 ESC 双击菜单逻辑：
+   * - 第一次按键：正常透传给主机 + 显示 Toast 提示
+   * - 第二次按键（500ms 内）：消费事件，释放所有键，打开串流菜单
+   *
+   * @param isDown true=按下, false=抬起
+   * @returns true 表示事件应被消费（不发送给主机），false 表示正常透传
+   */
+  private checkEscDoubleTap(isDown: boolean): boolean {
+    if (isDown) {
+      if (this.hasShownEscHint && Date.now() - this.lastEscUpTime <= StreamInputHandler.ESC_DOUBLE_TAP_INTERVAL) {
+        return true;
+      }
+      return false;
+    }
+
+    const now = Date.now();
+    if (this.hasShownEscHint && now - this.lastEscUpTime <= StreamInputHandler.ESC_DOUBLE_TAP_INTERVAL) {
+      this.lastEscUpTime = 0;
+      this.hasShownEscHint = false;
+      this.releaseAllKeys();
+      this.onShowStreamMenu?.();
+      return true;
+    }
+
+    this.lastEscUpTime = now;
+    this.hasShownEscHint = true;
+    const keyLabel = this.getMenuKeyLabel();
+    ToastQueue.show({ message: `再次按 ${keyLabel} 打开串流菜单`, duration: 1500 });
+    return false;
+  }
+
+  /** 获取当前菜单键的显示名称 */
+  private getMenuKeyLabel(): string {
+    switch (this.menuKeyCode) {
+      case 2090: return 'F1';
+      case 2101: return 'F12';
+      case 2056: return '~';
+      default: return 'ESC';
+    }
+  }
+
+  // ==================== 音量键 ====================
+
+  /**
+   * 处理音量键事件（回退路径）
+   * C++ 层优先尝试 OH_Input_InjectKeyEvent 回注到系统；
+   * 如果回注失败（无权限/API 不可用），音量键事件到达这里，
+   * 用 OH_AudioRenderer 的应用级音量补偿。
+   */
+  private handleVolumeKey(keyCode: number): void {
+    const session = this.viewModel?.getSession();
+    if (!session) {
+      return;
+    }
+
+    if (keyCode === 16) {
+      this.appVolume = Math.min(1.0, this.appVolume + StreamInputHandler.VOLUME_STEP);
+    } else if (keyCode === 17) {
+      this.appVolume = Math.max(0.0, this.appVolume - StreamInputHandler.VOLUME_STEP);
+    } else if (keyCode === 22) {
+      if (this.appVolume > 0) {
+        this.preMuteVolume = this.appVolume;
+        this.appVolume = 0.0;
+      } else {
+        this.appVolume = this.preMuteVolume > 0 ? this.preMuteVolume : 1.0;
+      }
+    }
+
+    this.appVolume = Math.round(this.appVolume * 10) / 10;
+    session.setAudioVolume(this.appVolume);
+
+    const percent = Math.round(this.appVolume * 100);
+    ToastQueue.show({
+      message: `音量 ${percent}%`,
+      duration: 1000
+    });
+  }
+}

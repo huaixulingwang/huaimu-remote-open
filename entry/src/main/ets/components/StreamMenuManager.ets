@@ -1,0 +1,331 @@
+/*
+ * Moonlight for HarmonyOS
+ * Copyright (C) 2024-2025 Moonlight/AlkaidLab
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ */
+
+/**
+ * 串流菜单管理器
+ * 
+ * 负责管理串流页面的菜单配置和业务逻辑
+ * 与 Android GameMenu 功能对齐
+ */
+import { promptAction } from '@kit.ArkUI';
+import { StreamingSession } from '../service/streaming/StreamingSession';
+import { StreamViewModel, TouchMode } from '../viewmodel/StreamViewModel';
+import { OptionPickerDialogConfig, OptionItem } from './dialogs/OptionPickerDialog';
+import { ToastQueue } from '../utils/ToastQueue';
+import { UsbForwardingService } from '../service/usbdriver/UsbForwardingService';
+
+// VirtualKey 统一定义在 CustomKeyTypes 中，此处 re-export 保持向后兼容
+import { VirtualKey } from '../service/customkey/CustomKeyTypes';
+import { Logger } from '../common/Logger';
+export { VirtualKey } from '../service/customkey/CustomKeyTypes';
+
+/**
+ * 菜单操作回调
+ */
+export interface StreamMenuCallbacks {
+  onResume: () => void;
+  onDisconnect: () => void;
+  onQuitGame: () => void;
+  onTouchModeChanged: (mode: string) => void;
+  onShowTouchModeMenu: () => void;
+}
+
+/**
+ * 串流菜单管理器
+ */
+export class StreamMenuManager {
+  private viewModel: StreamViewModel;
+  private callbacks: StreamMenuCallbacks;
+
+  constructor(viewModel: StreamViewModel, callbacks: StreamMenuCallbacks) {
+    this.viewModel = viewModel;
+    this.callbacks = callbacks;
+  }
+
+  /**
+   * 获取串流会话
+   */
+  private getSession(): StreamingSession | null {
+    return this.viewModel.getSession();
+  }
+
+  /**
+   * 显示 Toast 提示
+   */
+  private showToast(message: string): void {
+    try {
+      ToastQueue.show({
+        message: message,
+        duration: 1500
+      });
+    } catch (e) {
+      Logger.warn('StreamMenuManager', 'showToast failed:', e);
+    }
+  }
+
+  /**
+   * 获取触摸模式的中文名称
+   */
+  getTouchModeName(): string {
+    switch (this.viewModel.touchMode) {
+      case 'trackpad':
+        return '触摸板模式';
+      case 'direct':
+        return '直接触摸模式';
+      case 'mouse':
+        return '触摸鼠标';
+      case 'ds5_touchpad':
+        return 'DS5 触控板模式';
+      default:
+        return this.viewModel.touchMode;
+    }
+  }
+
+  /**
+   * 获取性能覆盖层状态描述
+   */
+  getPerformanceOverlayStatus(): string {
+    if (!this.viewModel.showOverlay) {
+      return '当前: 关闭';
+    } else if (this.viewModel.overlayState.config.isLocked) {
+      return '当前: 固定显示';
+    } else {
+      return '当前: 悬浮显示';
+    }
+  }
+
+  /**
+   * 获取 USB 直通状态行（串流菜单展示）
+   */
+  getUsbForwardingStatusLine(): string {
+    const status = UsbForwardingService.getInstance().getStatus();
+    switch (status.phase) {
+      case 'disabled':
+        return '未启用，点按开启并转发 OTG 手柄';
+      case 'no-device':
+        return '未检测到 OTG 手柄，点按重试';
+      case 'starting':
+        return `连接中: ${status.deviceName}`;
+      case 'ready':
+        return `已直通: ${status.deviceName}，点按停止`;
+      case 'error': {
+        const brief = status.message.length > 36
+          ? `${status.message.substring(0, 36)}…` : status.message;
+        return `失败: ${brief}，点按重试`;
+      }
+      default:
+        return '未转发，点按开始';
+    }
+  }
+
+  /**
+   * 处理 USB 直通菜单动作（ready→停止，其余→开启/重试）
+   */
+  private handleUsbForwardingAction(): void {
+    const service = UsbForwardingService.getInstance();
+    const phase = service.getStatus().phase;
+    if (phase === 'starting') {
+      this.showToast('USB 直通连接中，请稍候');
+      return;
+    }
+    if (phase === 'ready') {
+      service.stopForwardingFromMenu();
+      this.showToast('已停止 USB 直通，手柄交还本地处理');
+      return;
+    }
+    const enableSetting = phase === 'disabled';
+    service.startForwardingFromMenu(enableSetting)
+      .then((): void => {
+        this.showToast(enableSetting ? '已开启 USB 直通，正在转发' : '正在重试 USB 直通');
+      })
+      .catch((err: Error): void => {
+        Logger.warn('StreamMenuManager', `USB 直通菜单操作失败: ${err.message}`);
+      });
+  }
+
+  /**
+   * 获取主串流菜单配置
+   */
+  getStreamMenuConfig(): OptionPickerDialogConfig {
+    const options: OptionItem[] = [
+      {
+        title: '🎮 继续游戏',
+        subtitle: '关闭此菜单，继续串流',
+        value: 'resume'
+      },
+      {
+        title: '⎋ 发送 ESC',
+        subtitle: '向远程发送 ESC 键',
+        value: 'send_esc'
+      },
+      {
+        title: '⊞ 发送 Win',
+        subtitle: '打开/关闭 Windows 开始菜单',
+        value: 'send_win'
+      },
+      {
+        title: '🌈 切换 HDR',
+        subtitle: '发送 Win+Alt+B 切换 HDR',
+        value: 'toggle_hdr'
+      },
+      {
+        title: '⌨️ 打开主机键盘',
+        subtitle: '发送 Win+Ctrl+O 呼出系统键盘',
+        value: 'host_keyboard'
+      },
+      {
+        title: `👆 切换触摸模式`,
+        subtitle: `当前: ${this.getTouchModeName()}`,
+        value: 'touch_mode'
+      },
+      {
+        title: this.viewModel.showOverlay ? '📊 隐藏性能监控' : '📊 显示性能监控',
+        subtitle: this.getPerformanceOverlayStatus(),
+        value: 'toggle_overlay'
+      },
+      {
+        title: this.viewModel.showController ? '🎮 隐藏虚拟按键' : '🎮 显示虚拟按键',
+        subtitle: '切换屏幕虚拟控制器',
+        value: 'toggle_controller'
+      },
+      {
+        title: '🔌 USB 直通主机',
+        subtitle: this.getUsbForwardingStatusLine(),
+        value: 'usb_forwarding'
+      },
+      {
+        title: '🔌 断开连接',
+        subtitle: '结束串流但保持游戏运行',
+        value: 'disconnect'
+      },
+      {
+        title: '🚪 退出游戏',
+        subtitle: '关闭远程游戏并返回',
+        value: 'quit_game'
+      }
+    ];
+
+    return {
+      title: '🍥 串流菜单',
+      subtitle: '按返回键可再次打开此菜单',
+      options: options,
+      selectedValue: '',
+      onSelect: (option: OptionItem) => {
+        this.handleMainMenuSelect(option);
+      }
+    };
+  }
+
+  /**
+   * 处理主菜单选择
+   */
+  private handleMainMenuSelect(option: OptionItem): void {
+    const session = this.getSession();
+
+    switch (option.value) {
+      case 'resume':
+        this.callbacks.onResume();
+        break;
+      case 'send_esc':
+        session?.sendKeys([VirtualKey.VK_ESCAPE]);
+        this.showToast('已发送 ESC');
+        break;
+      case 'send_win':
+        session?.sendKeys([VirtualKey.VK_LWIN]);
+        this.showToast('已发送 Win');
+        break;
+      case 'toggle_hdr':
+        session?.sendKeys([VirtualKey.VK_LWIN, VirtualKey.VK_MENU, VirtualKey.VK_B]);
+        this.showToast('已发送 Win+Alt+B');
+        break;
+      case 'host_keyboard':
+        session?.sendKeys([VirtualKey.VK_LWIN, VirtualKey.VK_CONTROL, VirtualKey.VK_O]);
+        this.showToast('已发送 Win+Ctrl+O');
+        break;
+      case 'touch_mode':
+        this.callbacks.onShowTouchModeMenu();
+        break;
+      case 'toggle_overlay':
+        this.viewModel.toggleOverlay();
+        break;
+      case 'toggle_controller':
+        this.viewModel.toggleController();
+        break;
+      case 'usb_forwarding':
+        this.handleUsbForwardingAction();
+        break;
+      case 'disconnect':
+        this.callbacks.onDisconnect();
+        break;
+      case 'quit_game':
+        this.callbacks.onQuitGame();
+        break;
+    }
+  }
+
+  /**
+   * 获取触摸模式子菜单配置
+   */
+  getTouchModeMenuConfig(): OptionPickerDialogConfig {
+    const currentMode = this.viewModel.touchMode;
+
+    const options: OptionItem[] = [
+      {
+        title: currentMode === 'trackpad' ? '✓ 触摸板模式' : '  触摸板模式',
+        subtitle: '相对移动，像使用笔记本触摸板',
+        value: 'trackpad'
+      },
+      {
+        title: currentMode === 'direct' ? '✓ 直接触摸模式' : '  直接触摸模式',
+        subtitle: '绝对坐标，点哪移哪',
+        value: 'direct'
+      },
+      {
+        title: currentMode === 'mouse' ? '✓ 触摸鼠标' : '  触摸鼠标',
+        subtitle: '相对移动 + 按住拖动',
+        value: 'mouse'
+      },
+      {
+        title: currentMode === 'ds5_touchpad' ? '✓ DS5 触控板' : '  DS5 触控板',
+        subtitle: '屏幕映射 DualSense 触控板，支持双指',
+        value: 'ds5_touchpad'
+      },
+      {
+        title: '🖱️ 切换远程鼠标指针',
+        subtitle: '发送 Ctrl+Alt+Shift+N 切换鼠标',
+        value: 'toggle_remote_mouse'
+      }
+    ];
+
+    return {
+      title: '👆 选择触摸模式',
+      subtitle: `当前: ${this.getTouchModeName()}`,
+      options: options,
+      selectedValue: this.viewModel.touchMode,
+      onSelect: (option: OptionItem) => {
+        this.handleTouchModeSelect(option);
+      }
+    };
+  }
+
+  /**
+   * 处理触摸模式选择
+   */
+  private handleTouchModeSelect(option: OptionItem): void {
+    if (option.value === 'toggle_remote_mouse') {
+      const session = this.getSession();
+      session?.sendKeys([VirtualKey.VK_CONTROL, VirtualKey.VK_MENU, VirtualKey.VK_SHIFT, VirtualKey.VK_N]);
+      this.showToast('已发送切换远程鼠标指针');
+    } else {
+      this.callbacks.onTouchModeChanged(option.value as string);
+      this.showToast(`已切换到${this.getTouchModeName()}`);
+    }
+  }
+}

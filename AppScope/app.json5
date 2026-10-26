@@ -1,0 +1,12 @@
+{
+  "app": {
+    "bundleName": "com.lingwang.remote",
+    "vendor": "LingWang",
+    "versionCode": 46,
+    "versionName": "0.2.44",
+    "icon": "$media:layered_icon",
+    "label": "$string:app_name",
+    "bundleType": "app",
+    "entityType": "game"
+  }
+}

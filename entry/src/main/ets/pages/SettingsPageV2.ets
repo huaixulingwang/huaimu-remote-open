@@ -1,0 +1,4813 @@
+/*
+ * Moonlight for HarmonyOS
+ * Copyright (C) 2024-2025 Moonlight/AlkaidLab
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ */
+
+import { promptAction, display } from '@kit.ArkUI';
+import { AppNav } from '../common/AppNav';
+import { LengthMetrics, ColorMetrics } from '@kit.ArkUI';
+import { common, Want, bundleManager } from '@kit.AbilityKit';
+import { pasteboard } from '@kit.BasicServicesKit';
+import { util } from '@kit.ArkTS';
+import { getSupportedDisplayRates } from '../utils/DisplayFrameRate';
+import { PreferencesUtil } from '../utils/PreferencesUtil';
+import { AppColors, AppSizes, AppSpacing, AppAnimation, AppShadows } from '../common/Theme';
+import { StreamingSession, DecoderCapabilities } from '../service/streaming/StreamingSession';
+import {
+  getRecommendedBitrate,
+  GAME_VIBRATION_STRENGTH_DEFAULT,
+  GAME_VIBRATION_STRENGTH_MAX,
+  GAME_VIBRATION_STRENGTH_MIN,
+  GAME_VIBRATION_STRENGTH_ORIGINAL,
+  GAME_VIBRATION_STRENGTH_STEP,
+  normalizeGameVibrationStrength
+} from '../model/StreamConfig';
+import { PerfLabels } from '../components/PerformanceOverlayManager';
+import { SettingSlider, SettingSliderConfig, LogarithmicSlider } from '../components/SettingSlider';
+import { SettingsBackupService } from '../service/SettingsBackupService';
+import { OptionPickerDialog, OptionPickerDialogConfig, OptionItem as DialogOptionItem } from '../components/dialogs/OptionPickerDialog';
+import { MultiOptionPickerDialog, MultiOptionPickerDialogConfig, MultiOptionItem as DialogMultiOptionItem } from '../components/dialogs/MultiOptionPickerDialog';
+import { BackgroundImageUtil, BackgroundImageType } from '../utils/BackgroundImageUtil';
+import { InputInterceptorService } from '../service/input/InputInterceptorService';
+import { GamepadManager } from '../service/input/GamepadManager';
+import { SettingsKeys, UiSettings } from '../service/SettingsService';
+import { loadChangelog, ChangelogEntry, ChangeItem, getChangeTypeConfig } from '../common/Changelog';
+import { InlineSegmentPicker } from '../components/InlineSegmentPicker';
+import { isAihdrSupported } from '../components/AihdrModifier';
+import { DevKeyVerifier } from '../utils/DevKeyVerifier';
+import { DeveloperUnlockResult, DeveloperUnlockService, DeveloperUnlockStatus } from '../service/DeveloperUnlockService';
+import { GitHubDeviceCode } from '../utils/GitHubStarVerifier';
+import { ToastQueue } from '../utils/ToastQueue';
+import { METERED_BANDWIDTH_PROBE_MAX_BYTES } from '../service/network/BandwidthProbeService';
+import { GYRO_SENSITIVITY_MIN, GYRO_SENSITIVITY_MAX } from '../service/input/GyroAssistService';
+import { Logger } from '../common/Logger';
+import { AccountCenterService, AccountSnapshot, AccountDevice } from '../service/account/AccountCenterService';
+import { ComputerManager } from '../service/ComputerManager';
+
+/**
+ * 选择器选项接口
+ */
+interface PickerOption {
+  title: string;
+  subtitle?: string;
+  value: string | number;
+}
+
+/**
+ * 性能覆盖层项目选项
+ */
+class PerfOverlayItemOption {
+  key: string;
+  title: string;
+  
+  constructor(key: string, title: string) {
+    this.key = key;
+    this.title = title;
+  }
+}
+
+class ResolutionPreset {
+  label: string;
+  w: string;
+  h: string;
+  constructor(label: string, w: string, h: string) {
+    this.label = label;
+    this.w = w;
+    this.h = h;
+  }
+}
+
+/**
+ * 选择器配置接口
+ */
+interface PickerConfig {
+  title: string;
+  subtitle?: string;
+  options: PickerOption[];
+  selectedValue: string | number;
+  onSelect: (option: PickerOption) => void;
+}
+
+/**
+ * 设置项数据
+ */
+interface SettingItem {
+  title: string;
+  subtitle?: string;
+  tooltip?: string;
+  type: 'toggle' | 'select' | 'input' | 'action' | 'slider' | 'segment' | 'grid';
+  key?: string;
+  value?: string | boolean | number;
+  options?: string[];
+  action?: () => void;
+  disabled?: boolean;  // 是否禁用
+  isPro?: boolean;     // 是否为 Pro 功能（需要开发者模式）
+  visible?: boolean;   // 是否可见（用于条件显示子选项，默认 true）
+  // Slider 专用属性
+  min?: number;
+  max?: number;
+  step?: number;
+  unit?: string;
+  onSliderChange?: (value: number) => void;
+  snapValues?: number[];  // 吸附的关键数值
+  snapThreshold?: number; // 吸附阈值，默认为 step 的一半
+  isLogarithmic?: boolean; // 是否使用对数刻度（适用于大范围值如码率）
+  formatValue?: (value: number) => string;  // 自定义值格式化函数
+  // Segment 分段按钮专用属性
+  segmentLabels?: string[];   // 分段按钮显示文字
+  segmentValues?: string[];   // 分段按钮对应的实际值（可选，默认与 labels 相同）
+  onSegmentChange?: (value: string) => void;  // 选择变化回调
+  // Grid 九宫格专用属性
+  gridLabels?: string[];       // 九宫格按钮标签（按行排列，如 3x3 = 9 个）
+  gridValues?: string[];       // 九宫格按钮对应值
+  gridColumns?: number;        // 列数（默认 3）
+  onGridSelect?: (value: string) => void;  // 选中回调
+}
+
+/**
+ * 设置分组
+ */
+interface SettingGroup {
+  id: string;      // 分组唯一标识
+  icon: Resource;  // 分组图标
+  title: string;
+  items: SettingItem[];
+}
+
+/**
+ * 侧边栏分组元数据（用于宽屏侧边导航）
+ */
+interface SidebarGroupMeta {
+  id: string;
+  icon: Resource;
+  title: string;
+}
+
+/**
+ * 设置页面 (现代化版本)
+ */
+@Component
+struct SettingsPageV2 {
+  @StorageProp('topSafeHeight') topSafeHeight: number = 56;  // 动态状态栏安全区高度
+  // 视频设置
+  @State resolution: string = 'native';
+  @State customResolutions: string[] = [];  // 自定义分辨率列表，格式如 "1920x1080"
+  @State fps: string = '60 FPS';
+  @State customFps: number = 0;  // 自定义帧率值 (0 表示使用预设)
+  @State bitrate: number = 20;
+  @State bandwidthProbeEnabled: boolean = false;
+  @State meteredBandwidthProbeEnabled: boolean = false;
+  @State adaptiveBitrate: boolean = false;
+  @State hostScale: number = 100;
+  @State enableHdr: boolean = false;
+  @State hdrMode: string = 'HDR10';  // 'HDR10' or 'HLG'
+  @State enableHdrHighBrightness: boolean = false;
+  @State hdrBrightnessOverride: boolean = false;
+  @State hdrPeakBrightnessNits: number = 1000;
+  @State videoFormat: string = '自动';
+  @State stretchVideo: boolean = false;
+  @State screenPosition: string = '居中';
+  @State screenOffsetX: number = 0;
+  @State screenOffsetY: number = 0;
+  @State fullRange: boolean = false;
+  @State reverseResolution: boolean = false;
+  @State rotableScreen: boolean = false;
+  
+  // 音频设置
+  @State audioConfig: string = '立体声';
+  @State enableLocalAudio: boolean = false;
+  @State enableSpatializer: boolean = false;
+  @State controlOnly: boolean = false;
+  @State enableMic: boolean = false;
+  @State micBitrate: number = 64;
+  @State audioCompatMode: boolean = false;
+  
+  // 剪贴板同步（Sunshine only）
+  @State enableClipboardSyncText: boolean = false;
+  @State enableClipboardSyncImage: boolean = false;
+  
+  // 输入 - 手柄设置
+  @State enableVibration: boolean = true;
+  @State vibrationMode: string = '自动';  // 自动/仅手柄/仅设备/协同
+  @State gameVibrationStrength: number = GAME_VIBRATION_STRENGTH_DEFAULT;
+  @State enableAudioVibration: boolean = false;
+  @State audioVibrationStrength: number = 60;
+  @State audioVibrationSceneMode: string = '游戏/电影';
+  @State multiController: boolean = true;
+  @State flipFaceButtons: boolean = false;
+  @State deadzone: number = 7;
+  @State gamepadMotionSensors: boolean = true;
+  @State gamepadMotionFallback: boolean = false;
+  @State gamepadTouchpadMouse: boolean = false;
+  @State enableStartKeyMenu: boolean = true;
+  @State enableKeyInterceptor: boolean = false;
+  @State keyInterceptorAvailable: boolean = false;  // 按键注入 API 是否可用（API 13+ 才支持反劫持）
+  @State gcButtonHomeMapping: string = 'guide';  // 2313键（Guide/Mode 兼容键）动作映射
+  @State usbDriverEnabled: boolean = false;  // 默认关闭 USB 手柄驱动
+  @State forceUsbDriverOnly: boolean = false;  // 强制纯 USB 驱动模式
+  @State ddkHighSpeedPolling: boolean = false;  // USB 驱动高速轮询
+  @State usbForwardingEnabled: boolean = false;  // USB/IP 反向隧道转发
+  
+  // 输入 - 屏幕控制器
+  @State enableOnscreenControls: boolean = false;
+  @State enableOnscreenKeyboard: boolean = false;
+  @State onlyL3R3: boolean = false;
+  @State showGuideButton: boolean = true;
+  @State halfHeightOscPortrait: boolean = true;
+  @State oscOpacity: number = 90;
+  @State vibrateOsc: boolean = true;
+  
+  // 输入 - 鼠标/触控
+  @State showLocalCursor: boolean = false;   // 显示本地指针（双光标模式）
+  @State touchscreenTrackpad: boolean = false;
+  @State enableThreeFingerIme: boolean = true;
+  @State lowLatencyTouch: boolean = false;
+  @State enableDoubleClickDrag: boolean = false;
+  @State doubleTapTimeThreshold: number = 125;
+  @State mouseNavButtons: boolean = false;
+  @State gameMouseMode: boolean = false;   // 游戏鼠标模式（相对模式+光标回弹）
+  
+  // 体感助手设置
+  @State gyroAssistEnabled: boolean = false;
+  @State gyroSensitivity: number = 1.0;
+  @State gyroInvertX: boolean = false;
+  @State gyroInvertY: boolean = false;
+  @State gyroActivationKey: number = -1;
+  
+  // 主机设置
+  @State enableSops: boolean = true;
+  @State privacyScreenEnabled: boolean = false;
+  @State screenCombinationMode: string = '主机默认';
+  @State lockScreenAfterDisconnect: boolean = false;
+  
+  // 高级设置
+  @State decoderBufferCount: number = 0;
+  @State enableSyncDecode: boolean = false;  // 同步解码模式，默认禁用
+  @State enableVrr: boolean = false;  // VRR 可变刷新率，默认禁用
+  @State enableVsync: boolean = false;
+  @State enableHostPacedPresentation: boolean = true;
+  @State enablePostProcess: boolean = false;  // 后处理滤镜（暗区抖动补偿）
+  @State upscaleMode: number = 0;             // 超分辨率模式
+  @State upscaleSharpness: number = 50;       // 超分锐度 (0-100)
+  @State sdrToHdr: boolean = false;            // SDR→HDR（派生自 sdrToHdrMode===1）
+  @State sdrToHdrMode: number = 0;             // HDR 增强模式 (0=关闭,1=自研shader,2=AIHDR)
+  @State aihdrSupported: boolean = false;      // 设备是否支持 AIHDR
+  @State sdrToHdrPeakNits: number = 500;       // SDR→HDR 峰值亮度
+  @State sdrToHdrSaturation: number = 130;     // SDR→HDR 色彩饱和度 (50-200)
+  @State sdrToHdrContrast: number = 100;       // SDR→HDR 对比度 (50-200)
+  @State performanceMode: boolean = false;  // 性能模式，默认禁用
+  @State enablePerfOverlay: boolean = false;
+  @State perfOverlayOrientation: string = '垂直';
+  @State perfOverlayPosition: string = '右上角';
+  @State perfOverlayLocked: boolean = false;
+  @State perfOverlayItems: string[] = ['resolution', 'decoder', 'render_fps', 'packet_loss', 'bitrate', 'network_latency', 'decode_latency'];
+  @State latencyToast: boolean = false;
+  @State disableWarnings: boolean = false;
+  @State enableStun: boolean = false;
+  @State enableEscMenu: boolean = true;
+  @State escMenuKey: string = 'ESC';
+  @State enableBackgroundTask: boolean = true;  // 后台保活，默认开启
+  
+  // 备份
+  @State autoBackupEnabled: boolean = false;
+  
+  // UI 设置
+  @StorageLink('smallIconMode') smallIconMode: boolean = false;
+  @State backgroundImageType: string = 'default';
+  @State backgroundImageUrl: string = '';
+  @State resumeStream: boolean = false;
+  @State developerMode: boolean = false;  // 开发者模式
+  @State developerUnlockBusy: boolean = false;
+  private devKeyActivated: boolean = false;  // 激活码已验证过
+  private developerPendingDialogVisible: boolean = false;
+  private developerPendingResumeBusy: boolean = false;
+  
+  // 统一账号
+  @State accountLoggedIn: boolean = false;
+  @State accountDisplayName: string = '';
+  @State accountAuthorized: boolean = false;
+  @State accountAccountId: string = '';
+
+  // 应用版本
+  @State appVersion: string = '';
+  @State activePopupKey: string = '';  // 当前显示气泡提示的设置项 key
+  
+  // 加载状态
+  @State isLoading: boolean = true;
+  
+  // 当前展开的分组（默认展开隐私管理）
+  @State expandedGroup: string = 'privacy';
+
+  // 高级设置区是否展开（普通用户默认收起，主动点击才展开）
+  @State advancedExpanded: boolean = false;
+
+  // 宽屏模式（横屏时使用左导航+右内容布局）
+  @State isWideScreen: boolean = false;
+
+  // 侧边栏分组元数据 —— 普通分组（一进设置就能看到）
+  private sidebarNormalGroups: SidebarGroupMeta[] = [
+    { id: 'account', icon: $r('sys.symbol.person_fill'), title: '账号' },
+    { id: 'privacy', icon: $r('sys.symbol.lock_fill'), title: '隐私管理' },
+  ];
+  // 侧边栏分组元数据 —— 高级分组（Moonlight 原有专业参数，收进「高级设置」）
+  private sidebarAdvancedGroups: SidebarGroupMeta[] = [
+    { id: 'video', icon: $r('sys.symbol.video_fill'), title: '视频' },
+    { id: 'audio', icon: $r('sys.symbol.speaker_wave_2_fill'), title: '音频' },
+    { id: 'vibration', icon: $r('sys.symbol.waveform'), title: '振动' },
+    { id: 'gamepad', icon: $r('sys.symbol.gamecontroller_fill'), title: '手柄' },
+    { id: 'usb_driver', icon: $r('sys.symbol.charg_cable'), title: 'USB 驱动' },
+    { id: 'osc', icon: $r('sys.symbol.gamecontroller'), title: '屏幕控制器' },
+    { id: 'mouse', icon: $r('sys.symbol.mouse'), title: '鼠标触控' },
+    { id: 'host', icon: $r('sys.symbol.computer_host_fill'), title: '主机' },
+    { id: 'post_process', icon: $r('sys.symbol.wand_and_stars'), title: '后处理' },
+    { id: 'performance', icon: $r('sys.symbol.slider_horizontal_2'), title: '性能与调试' },
+    { id: 'ui', icon: $r('sys.symbol.display'), title: '界面' },
+    { id: 'backup', icon: $r('sys.symbol.share'), title: '备份' },
+  ];
+  // 普通分组尾部（关于）
+  private sidebarFooterGroups: SidebarGroupMeta[] = [
+    { id: 'about', icon: $r('sys.symbol.info_circle_fill'), title: '关于' },
+  ];
+  
+  // 解码器能力
+  @State decoderCapabilities: DecoderCapabilities | null = null;
+  
+  // 文本输入弹窗状态
+  @State showTextInputDialog: boolean = false;
+  @State textInputTitle: string = '';
+  @State textInputPlaceholder: string = '';
+  @State textInputValue: string = '';
+  private textInputCallback: ((value: string) => void) | null = null;
+  private textInputDismissCallback: (() => void) | null = null;
+  
+  // 自定义分辨率输入弹窗状态
+  @State customResWidth: string = '';
+  @State customResHeight: string = '';
+  @State customResAspectRatio: string = '';
+  
+  // 底部弹窗类型: 'text' = 文本输入, 'resolution' = 自定义分辨率
+  private bottomSheetType: string = 'text';
+  
+  // OptionPickerDialog 配置
+  private optionPickerDialogConfig: OptionPickerDialogConfig = {
+    title: '',
+    options: [],
+    onSelect: () => {}
+  };
+  
+  // MultiOptionPickerDialog 配置
+  private multiOptionPickerDialogConfig: MultiOptionPickerDialogConfig = {
+    title: '',
+    options: [],
+    selectedKeys: [],
+    minSelected: 1,
+    onSelectionChange: () => {}
+  };
+  
+  // CustomDialogController
+  private optionPickerDialogController: CustomDialogController | null = null;
+  private multiOptionPickerDialogController: CustomDialogController | null = null;
+  private licensesDialogController: CustomDialogController | null = null;
+  private privacyDialogController: CustomDialogController | null = null;
+  private changelogDialogController: CustomDialogController | null = null;
+  
+  // 本地分辨率
+  private nativeWidth: number = 0;
+  private nativeHeight: number = 0;
+
+  aboutToAppear(): void {
+    this.loadVersionInfo();
+    this.loadNativeResolution();
+    this.loadSettings();
+    this.loadDecoderCapabilities();
+    this.refreshAccountState();
+  }
+
+  onPageShow(): void {
+    // 隐私屏可在串流菜单中切换（设置已落盘），返回本页时必须重新读取，
+    // 否则开关显示与全局真实状态不同步；屏幕组合模式也可能在关闭隐私时被复位
+    this.refreshPrivacyState();
+    this.refreshAccountState();
+    setTimeout(() => {
+      this.resumeDeveloperPendingUnlock();
+    }, 250);
+  }
+
+  /** 仅刷新隐私屏及受其联动的屏幕组合模式（轻量，避免整页重载） */
+  private async refreshPrivacyState(): Promise<void> {
+    try {
+      const value = await PreferencesUtil.get<string | boolean>(SettingsKeys.PRIVACY_SCREEN_ENABLED, false);
+      this.privacyScreenEnabled = value === true || value === 'true';
+      this.screenCombinationMode =
+        await PreferencesUtil.get<string>(SettingsKeys.SCREEN_COMBINATION_MODE, '主机默认');
+    } catch (err) {
+      Logger.warn('SettingsPageV2', `刷新隐私屏状态失败: ${(err as Error).message}`);
+    }
+  }
+
+  /** 刷新统一账号登录态（只读本地快照，不发网络请求） */
+  private async refreshAccountState(): Promise<void> {
+    try {
+      const snapshot: AccountSnapshot = await AccountCenterService.getSnapshot();
+      this.accountLoggedIn = snapshot.loggedIn;
+      this.accountDisplayName = snapshot.displayName;
+      this.accountAuthorized = snapshot.authorized;
+      this.accountAccountId = snapshot.accountId;
+    } catch (err) {
+      Logger.warn('SettingsPageV2', `刷新账号状态失败: ${(err as Error).message}`);
+    }
+  }
+
+  private async logoutAccount(): Promise<void> {
+    promptAction.showDialog({
+      title: '退出登录',
+      message: '退出后不再同步云端设备；从账号同步来的电脑会从首页移除，配对过的会留在「配对记录」里。手动添加的本地电脑不受影响。',
+      buttons: [
+        { text: '取消', color: '#A8B0B8' },
+        { text: '退出', color: '#FF6B6B' }
+      ]
+    }).then((result: promptAction.ShowDialogSuccessResponse) => {
+      if (result.index === 1) {
+        this.finishLogout();
+      }
+    });
+  }
+
+  /**
+   * 退出账号：先用「还没失效的令牌」把云端名单里的电脑补记为账号来源，
+   * 再退出登录并清理首页列表（留下的记录放「配对记录」页）。
+   */
+  private async finishLogout(): Promise<void> {
+    const manager = ComputerManager.getInstance();
+    try {
+      const snapshot = await AccountCenterService.getSnapshot();
+      if (snapshot.loggedIn) {
+        const devices: AccountDevice[] = await AccountCenterService.fetchDevices();
+        const uuids: string[] = [];
+        for (const device of devices) {
+          if (device.device_type === 'pc' && device.sunshine_id !== undefined && device.sunshine_id.length > 0) {
+            uuids.push(device.sunshine_id);
+          }
+        }
+        await manager.markAccountDevices(uuids);
+      }
+    } catch (err) {
+      Logger.warn('SettingsPageV2', `退出前同步账号设备失败: ${(err as Error).message}`);
+    }
+
+    await AccountCenterService.logout();
+
+    try {
+      await manager.removeAccountDevices();
+    } catch (err) {
+      Logger.warn('SettingsPageV2', `退出账号清理失败: ${(err as Error).message}`);
+    }
+    this.refreshAccountState();
+    ToastQueue.show({ message: '已退出登录' });
+  }
+
+  private loadVersionInfo(): void {
+    try {
+      const bundleInfo = bundleManager.getBundleInfoForSelfSync(bundleManager.BundleFlag.GET_BUNDLE_INFO_DEFAULT);
+      this.appVersion = bundleInfo.versionName;
+    } catch (e) {
+      this.appVersion = '未知';
+    }
+  }
+  
+  /**
+   * 获取设备本地分辨率（始终转换为横屏格式：宽 > 高）
+   */
+  private loadNativeResolution(): void {
+    try {
+      const displayInfo = display.getDefaultDisplaySync();
+      // 确保始终是横屏格式（宽 > 高）
+      if (displayInfo.width >= displayInfo.height) {
+        this.nativeWidth = displayInfo.width;
+        this.nativeHeight = displayInfo.height;
+      } else {
+        // 竖屏状态下交换宽高
+        this.nativeWidth = displayInfo.height;
+        this.nativeHeight = displayInfo.width;
+      }
+      Logger.info('SettingsPageV2', `本地分辨率 (横屏): ${this.nativeWidth}x${this.nativeHeight}`);
+    } catch (e) {
+      Logger.error('SettingsPageV2', `获取本地分辨率失败: ${e}`);
+      this.nativeWidth = 0;
+      this.nativeHeight = 0;
+    }
+  }
+  
+  /**
+   * 显示 Toast 提示
+   * @param message 提示消息
+   * @param duration 持续时间（毫秒），默认 2000ms
+   */
+  private showToast(message: string, duration: number = 2000): void {
+    ToastQueue.show({
+      message: message,
+      duration: duration
+    });
+  }
+  
+  private loadDecoderCapabilities(): void {
+    try {
+      this.decoderCapabilities = StreamingSession.getDecoderCapabilities();
+      Logger.info('SettingsPageV2', `解码器能力: H264=${this.decoderCapabilities.supportsH264}, HEVC=${this.decoderCapabilities.supportsHEVC}, AV1=${this.decoderCapabilities.supportsAV1}`);
+    } catch (e) {
+      Logger.error('SettingsPageV2', `获取解码器能力失败: ${e}`);
+      // 默认假设只支持 H.264
+      this.decoderCapabilities = {
+        supportsH264: true,
+        supportsHEVC: false,
+        supportsAV1: false,
+        maxWidth: 1920,
+        maxHeight: 1080,
+        maxFps: 60,
+        supportsLowLatency: false,
+        supports4K60: false,
+        supports4K120: false,
+        supports1080p120: false,
+        maxInstances: 1
+      };
+    }
+  }
+
+  /**
+   * 获取当前设置的推荐码率（Mbps）
+   */
+  private getRecommendedBitrateForCurrentSettings(): number {
+    // 解析当前分辨率
+    let width = 1920;
+    let height = 1080;
+    switch (this.resolution) {
+      case '720p': width = 1280; height = 720; break;
+      case '1080p': width = 1920; height = 1080; break;
+      case '1440p': width = 2560; height = 1440; break;
+      case '4K': width = 3840; height = 2160; break;
+      case 'native':
+        // 本机分辨率：始终横屏方向
+        if (this.nativeWidth > 0 && this.nativeHeight > 0) {
+          width = Math.max(this.nativeWidth, this.nativeHeight);
+          height = Math.min(this.nativeWidth, this.nativeHeight);
+        }
+        break;
+      default:
+        // 尝试解析自定义分辨率格式 WIDTHxHEIGHT
+        const match = this.resolution.match(/^(\d+)x(\d+)$/);
+        if (match) {
+          width = parseInt(match[1]);
+          height = parseInt(match[2]);
+        }
+    }
+    
+    // 应用缩放
+    if (this.hostScale !== 100) {
+      width = Math.round(width * this.hostScale / 100);
+      height = Math.round(height * this.hostScale / 100);
+    }
+    
+    // 解析帧率
+    let fps = 60;
+    if (this.fps.startsWith('自定义:')) {
+      // 自定义帧率
+      fps = parseInt(this.fps.split(':')[1]) || 60;
+    } else {
+      switch (this.fps) {
+        case '30 FPS': fps = 30; break;
+        case '60 FPS': fps = 60; break;
+        case '90 FPS': fps = 90; break;
+        case '119.88 FPS': fps = 120; break;
+        case '120 FPS': fps = 120; break;
+        default: fps = 60; break;
+      }
+    }
+    
+    // 计算推荐码率（返回 Mbps）
+    return Math.round(getRecommendedBitrate(width, height, fps) / 1000);
+  }
+
+  private async loadSettings(): Promise<void> {
+    try {
+      // 视频设置
+      this.resolution = await PreferencesUtil.get<string>(SettingsKeys.RESOLUTION, 'native');
+      // 加载自定义分辨率列表
+      const customResStr = await PreferencesUtil.get<string>(SettingsKeys.CUSTOM_RESOLUTIONS, '');
+      this.customResolutions = customResStr ? customResStr.split(',').filter(s => s.length > 0) : [];
+      this.fps = await PreferencesUtil.get<string>(SettingsKeys.FPS, '60 FPS');
+      this.customFps = await PreferencesUtil.get<number>(SettingsKeys.CUSTOM_FPS, 0);
+      this.bitrate = await PreferencesUtil.get<number>(SettingsKeys.BITRATE, 0);
+      this.bandwidthProbeEnabled = await this.loadBoolean(SettingsKeys.BANDWIDTH_PROBE_ENABLED, false);
+      this.meteredBandwidthProbeEnabled = await this.loadBoolean(
+        SettingsKeys.METERED_BANDWIDTH_PROBE_ENABLED, false);
+      this.adaptiveBitrate = await this.loadBoolean(SettingsKeys.ADAPTIVE_BITRATE, false);
+      this.hostScale = await PreferencesUtil.get<number>(SettingsKeys.HOST_SCALE, 100);
+      this.enableHdr = await this.loadBoolean(SettingsKeys.ENABLE_HDR, false);
+      this.hdrMode = await PreferencesUtil.get<string>(SettingsKeys.HDR_MODE, 'HDR10');
+      this.enableHdrHighBrightness = await this.loadBoolean(SettingsKeys.ENABLE_HDR_HIGH_BRIGHTNESS, false);
+      this.hdrBrightnessOverride = await this.loadBoolean(SettingsKeys.HDR_BRIGHTNESS_OVERRIDE, false);
+      this.hdrPeakBrightnessNits = await PreferencesUtil.get<number>(SettingsKeys.HDR_PEAK_BRIGHTNESS_NITS, 1000);
+      this.videoFormat = await PreferencesUtil.get<string>(SettingsKeys.VIDEO_FORMAT, '自动');
+      this.stretchVideo = await this.loadBoolean(SettingsKeys.STRETCH_VIDEO, false);
+      this.screenPosition = await PreferencesUtil.get<string>(SettingsKeys.SCREEN_POSITION, '居中');
+      this.screenOffsetX = await PreferencesUtil.get<number>(SettingsKeys.SCREEN_OFFSET_X, 0);
+      this.screenOffsetY = await PreferencesUtil.get<number>(SettingsKeys.SCREEN_OFFSET_Y, 0);
+      this.fullRange = await this.loadBoolean(SettingsKeys.FULL_RANGE, false);
+      this.reverseResolution = await this.loadBoolean(SettingsKeys.REVERSE_RESOLUTION, false);
+      this.rotableScreen = await this.loadBoolean(SettingsKeys.ROTABLE_SCREEN, false);
+      
+      // 音频设置
+      this.audioConfig = await PreferencesUtil.get<string>(SettingsKeys.AUDIO_CONFIG, '立体声');
+      this.enableLocalAudio = await this.loadBoolean(SettingsKeys.ENABLE_LOCAL_AUDIO, false);
+      this.enableSpatializer = await this.loadBoolean(SettingsKeys.ENABLE_SPATIALIZER, false);
+      this.controlOnly = await this.loadBoolean(SettingsKeys.CONTROL_ONLY, false);
+      this.enableMic = await this.loadBoolean(SettingsKeys.ENABLE_MIC, false);
+      this.micBitrate = await PreferencesUtil.get<number>(SettingsKeys.MIC_BITRATE, 64);
+      this.audioCompatMode = await this.loadBoolean(SettingsKeys.AUDIO_COMPAT_MODE, false);
+      
+      // 剪贴板同步设置
+      this.enableClipboardSyncText = await this.loadBoolean(SettingsKeys.ENABLE_CLIPBOARD_SYNC_TEXT, false);
+      this.enableClipboardSyncImage = await this.loadBoolean(SettingsKeys.ENABLE_CLIPBOARD_SYNC_IMAGE, false);
+      
+      // 输入 - 手柄设置
+      this.enableVibration = await this.loadBoolean(SettingsKeys.ENABLE_VIBRATION, true);
+      this.vibrationMode = await PreferencesUtil.get<string>(SettingsKeys.VIBRATION_MODE, '自动');
+      this.gameVibrationStrength = await this.loadGameVibrationStrength();
+      this.enableAudioVibration = await this.loadBoolean(SettingsKeys.ENABLE_AUDIO_VIBRATION, false);
+      this.audioVibrationStrength = await PreferencesUtil.get<number>(SettingsKeys.AUDIO_VIBRATION_STRENGTH, 60);
+      this.audioVibrationSceneMode = await PreferencesUtil.get<string>(SettingsKeys.AUDIO_VIBRATION_SCENE_MODE, '游戏/电影');
+      this.multiController = await this.loadBoolean(SettingsKeys.MULTI_CONTROLLER, true);
+      this.flipFaceButtons = await this.loadBoolean(SettingsKeys.FLIP_FACE_BUTTONS, false);
+      this.deadzone = await PreferencesUtil.get<number>(SettingsKeys.DEADZONE, 7);
+      this.gamepadMotionSensors = await this.loadBoolean(SettingsKeys.GAMEPAD_MOTION_SENSORS, true);
+      this.gamepadMotionFallback = await this.loadBoolean(SettingsKeys.GAMEPAD_MOTION_FALLBACK, false);
+      this.gamepadTouchpadMouse = await this.loadBoolean(SettingsKeys.GAMEPAD_TOUCHPAD_MOUSE, false);
+      this.enableStartKeyMenu = await this.loadBoolean(SettingsKeys.ENABLE_START_KEY_MENU, true);
+      this.enableKeyInterceptor = await this.loadBoolean(SettingsKeys.ENABLE_KEY_INTERCEPTOR, false);
+      // 检查按键注入 API 是否可用（API 13+），不可用则强制禁用反劫持
+      this.keyInterceptorAvailable = InputInterceptorService.getInstance().isInjectApiAvailable();
+      if (!this.keyInterceptorAvailable && this.enableKeyInterceptor) {
+        this.enableKeyInterceptor = false;
+        this.saveSetting(SettingsKeys.ENABLE_KEY_INTERCEPTOR, false);
+      }
+      this.gcButtonHomeMapping = await PreferencesUtil.get<string>(SettingsKeys.GC_BUTTON_HOME_MAPPING, 'guide');
+      this.usbDriverEnabled = await this.loadBoolean(SettingsKeys.USB_DRIVER_ENABLED, false);
+      this.forceUsbDriverOnly = await this.loadBoolean(SettingsKeys.FORCE_USB_DRIVER_ONLY, false);
+      this.ddkHighSpeedPolling = await this.loadBoolean(SettingsKeys.DDK_HIGH_SPEED_POLLING, false);
+      this.usbForwardingEnabled = await this.loadBoolean(SettingsKeys.USB_FORWARDING_ENABLED, false);
+      
+      // 输入 - 屏幕控制器
+      this.enableOnscreenControls = await this.loadBoolean(SettingsKeys.ENABLE_ONSCREEN_CONTROLS, false);
+      this.enableOnscreenKeyboard = await this.loadBoolean(SettingsKeys.ENABLE_ONSCREEN_KEYBOARD, false);
+      this.onlyL3R3 = await this.loadBoolean(SettingsKeys.ONLY_L3_R3, false);
+      this.showGuideButton = await this.loadBoolean(SettingsKeys.SHOW_GUIDE_BUTTON, true);
+      this.halfHeightOscPortrait = await this.loadBoolean(SettingsKeys.HALF_HEIGHT_OSC_PORTRAIT, true);
+      this.oscOpacity = await PreferencesUtil.get<number>(SettingsKeys.OSC_OPACITY, 90);
+      this.vibrateOsc = await this.loadBoolean(SettingsKeys.VIBRATE_OSC, true);
+      
+      // 输入 - 鼠标/触控
+      this.showLocalCursor = await this.loadBoolean(SettingsKeys.SHOW_LOCAL_CURSOR, false);
+      this.touchscreenTrackpad = await this.loadBoolean(SettingsKeys.TOUCHSCREEN_TRACKPAD, false);
+      this.enableThreeFingerIme = await this.loadBoolean(SettingsKeys.ENABLE_THREE_FINGER_IME, true);
+      this.lowLatencyTouch = await this.loadBoolean(SettingsKeys.LOW_LATENCY_TOUCH, false);
+      this.enableDoubleClickDrag = await this.loadBoolean(SettingsKeys.ENABLE_DOUBLE_CLICK_DRAG, false);
+      this.doubleTapTimeThreshold = await PreferencesUtil.get<number>(SettingsKeys.DOUBLE_TAP_TIME_THRESHOLD, 125);
+      this.mouseNavButtons = await this.loadBoolean(SettingsKeys.MOUSE_NAV_BUTTONS, false);
+      this.gameMouseMode = await this.loadBoolean(SettingsKeys.GAME_MOUSE_MODE, false);
+      
+      // 体感助手设置
+      this.gyroAssistEnabled = await this.loadBoolean(SettingsKeys.GYRO_ASSIST_ENABLED, false);
+      this.gyroSensitivity = await PreferencesUtil.get<number>(SettingsKeys.GYRO_SENSITIVITY, 1.0);
+      this.gyroInvertX = await this.loadBoolean(SettingsKeys.GYRO_INVERT_X, false);
+      this.gyroInvertY = await this.loadBoolean(SettingsKeys.GYRO_INVERT_Y, false);
+      this.gyroActivationKey = await PreferencesUtil.get<number>(SettingsKeys.GYRO_ACTIVATION_KEY, -1);
+      
+      // 主机设置
+      this.enableSops = await this.loadBoolean(SettingsKeys.ENABLE_SOPS, true);
+      this.privacyScreenEnabled = await this.loadBoolean(SettingsKeys.PRIVACY_SCREEN_ENABLED, false);
+      this.screenCombinationMode = await PreferencesUtil.get<string>(SettingsKeys.SCREEN_COMBINATION_MODE, '主机默认');
+      this.lockScreenAfterDisconnect = await this.loadBoolean(SettingsKeys.LOCK_SCREEN_AFTER_DISCONNECT, false);
+      
+      // 高级设置
+      this.decoderBufferCount = await PreferencesUtil.get<number>(SettingsKeys.DECODER_BUFFER_COUNT, 0);
+      this.enableSyncDecode = await this.loadBoolean(SettingsKeys.ENABLE_SYNC_DECODE, false);  // 默认禁用
+      this.enableVrr = await this.loadBoolean(SettingsKeys.ENABLE_VRR, false);  // VRR 默认禁用
+      this.enableVsync = await this.loadBoolean(SettingsKeys.ENABLE_VSYNC, false);
+      this.enableHostPacedPresentation = await this.loadBoolean(
+        SettingsKeys.ENABLE_HOST_PACED_PRESENTATION, true);
+      this.enablePostProcess = await this.loadBoolean(SettingsKeys.ENABLE_POST_PROCESS, false);
+      this.upscaleMode = await PreferencesUtil.get<number>(SettingsKeys.UPSCALE_MODE, 0);
+      this.upscaleSharpness = await PreferencesUtil.get<number>(SettingsKeys.UPSCALE_SHARPNESS, 50);
+      const legacySdrToHdr = await this.loadBoolean(SettingsKeys.SDR_TO_HDR, false);
+      this.sdrToHdrMode = await PreferencesUtil.get<number>(SettingsKeys.SDR_TO_HDR_MODE, legacySdrToHdr ? 1 : 0);
+      this.sdrToHdr = (this.sdrToHdrMode === 1);
+      this.aihdrSupported = isAihdrSupported();
+      this.sdrToHdrPeakNits = await PreferencesUtil.get<number>(SettingsKeys.SDR_TO_HDR_PEAK_NITS, 500);
+      this.sdrToHdrSaturation = await PreferencesUtil.get<number>(SettingsKeys.SDR_TO_HDR_SATURATION, 130);
+      this.sdrToHdrContrast = await PreferencesUtil.get<number>(SettingsKeys.SDR_TO_HDR_CONTRAST, 100);
+      this.performanceMode = await this.loadBoolean(SettingsKeys.PERFORMANCE_MODE, false);  // 性能模式默认禁用
+      this.enablePerfOverlay = await this.loadBoolean(SettingsKeys.ENABLE_PERF_OVERLAY, false);
+      this.perfOverlayOrientation = await PreferencesUtil.get<string>(SettingsKeys.PERF_OVERLAY_ORIENTATION, '垂直');
+      this.perfOverlayPosition = await PreferencesUtil.get<string>(SettingsKeys.PERF_OVERLAY_POSITION, '右上角');
+      this.perfOverlayLocked = await this.loadBoolean(SettingsKeys.PERF_OVERLAY_LOCKED, false);
+      const itemsStr = await PreferencesUtil.get<string>(SettingsKeys.PERF_OVERLAY_ITEMS, 'resolution,decoder,render_fps,packet_loss,bitrate,network_latency,decode_latency');
+      this.perfOverlayItems = itemsStr.split(',').filter(item => item.length > 0);
+      this.latencyToast = await this.loadBoolean(SettingsKeys.LATENCY_TOAST, false);
+      this.disableWarnings = await this.loadBoolean(SettingsKeys.DISABLE_WARNINGS, false);
+      this.enableStun = await this.loadBoolean(SettingsKeys.ENABLE_STUN, false);
+      this.enableEscMenu = await this.loadBoolean(SettingsKeys.ENABLE_ESC_MENU, true);
+      this.escMenuKey = await PreferencesUtil.get<string>(SettingsKeys.ESC_MENU_KEY, 'ESC');
+      this.enableBackgroundTask = await this.loadBoolean(SettingsKeys.ENABLE_BACKGROUND_TASK, true);
+      
+      // UI 设置
+      // smallIconMode 由 UiSettings 统一管理（由 EntryAbility 在启动时预加载到 AppStorage）
+      this.backgroundImageType = await PreferencesUtil.get<string>(SettingsKeys.BACKGROUND_IMAGE_TYPE, 'default');
+      this.backgroundImageUrl = await PreferencesUtil.get<string>(SettingsKeys.BACKGROUND_IMAGE_URL, '');
+      this.resumeStream = await this.loadBoolean(SettingsKeys.RESUME_STREAM, false);
+      this.developerMode = await this.loadBoolean(SettingsKeys.DEVELOPER_MODE, false);
+      this.devKeyActivated = await this.loadBoolean(SettingsKeys.DEV_KEY_ACTIVATED, false);
+      await DeveloperUnlockService.restorePendingDeviceCode();
+      
+      // 备份
+      this.autoBackupEnabled = await SettingsBackupService.isAutoBackupEnabled();
+    } catch (error) {
+      Logger.error('SettingsPageV2', 'Failed to load settings:', error);
+    } finally {
+      this.isLoading = false;
+      setTimeout(() => {
+        this.resumeDeveloperPendingUnlock();
+      }, 250);
+    }
+  }
+  
+  /**
+   * 获取 Guide/Mode 键动作描述
+   */
+  private getHomeButtonActionDescription(): string {
+    switch (this.gcButtonHomeMapping) {
+      case 'guide': return '发送 Guide 键';
+      case 'select': return '发送 Select 键';
+      case 'toggle_mouse': return '切换鼠标模式';
+      case 'toggle_perf': return '切换性能图层';
+      case 'show_menu': return '显示游戏菜单';
+      case 'none': return '无动作';
+      default: return '发送 Guide 键';
+    }
+  }
+
+  private async loadBoolean(key: string, defaultVal: boolean): Promise<boolean> {
+    const val = await PreferencesUtil.get<boolean>(key, defaultVal);
+    if (typeof val === 'boolean') return val;
+    return String(val) === 'true';
+  }
+
+  private async loadGameVibrationStrength(): Promise<number> {
+    const rawValue = await PreferencesUtil.get<number | string>(
+      SettingsKeys.VIBRATE_FALLBACK_STRENGTH,
+      GAME_VIBRATION_STRENGTH_DEFAULT.toString()
+    );
+    let parsedValue = GAME_VIBRATION_STRENGTH_DEFAULT;
+    let shouldRepair = false;
+
+    if (typeof rawValue === 'number') {
+      parsedValue = Number.isFinite(rawValue) ? rawValue : GAME_VIBRATION_STRENGTH_DEFAULT;
+      shouldRepair = parsedValue !== rawValue;
+    } else {
+      const trimmedValue = rawValue.trim();
+      if (trimmedValue.length === 0) {
+        shouldRepair = true;
+      } else {
+        const numberValue = Number(trimmedValue);
+        if (Number.isFinite(numberValue)) {
+          parsedValue = numberValue;
+        } else {
+          shouldRepair = true;
+        }
+      }
+    }
+
+    const normalizedValue = normalizeGameVibrationStrength(parsedValue);
+    if (shouldRepair || normalizedValue !== parsedValue) {
+      this.saveSetting(SettingsKeys.VIBRATE_FALLBACK_STRENGTH, normalizedValue);
+    }
+    return normalizedValue;
+  }
+
+  private async saveSetting(key: string, value: string | boolean | number): Promise<void> {
+    try {
+      await PreferencesUtil.put(key, value);
+      SettingsBackupService.scheduleAutoSave();
+    } catch (error) {
+      Logger.error('SettingsPageV2', 'Failed to save setting:', error);
+      this.showToast('保存设置失败');
+    }
+  }
+  
+  /**
+   * 显示自定义选择器弹窗 - 使用 CustomDialogController
+   */
+  private showPicker(config: PickerConfig): void {
+    Logger.info('SettingsPageV2', `SettingsPageV2: showPicker 被调用, title=${config.title}`);
+    Logger.info('SettingsPageV2', `SettingsPageV2: options count = ${config.options?.length}`);
+    
+    // 转换为 DialogOptionItem 格式
+    const options: DialogOptionItem[] = config.options.map((option: PickerOption) => {
+      return {
+        title: option.title,
+        subtitle: option.subtitle,
+        value: option.value
+      } as DialogOptionItem;
+    });
+    
+    // 配置弹窗
+    this.optionPickerDialogConfig = {
+      title: config.title,
+      subtitle: config.subtitle,
+      options: options,
+      selectedValue: config.selectedValue,
+      onSelect: (option: DialogOptionItem) => {
+        Logger.info('SettingsPageV2', `SettingsPageV2: 选中了 ${option.title}`);
+        const pickerOption: PickerOption = {
+          title: option.title,
+          subtitle: option.subtitle,
+          value: option.value
+        };
+        config.onSelect(pickerOption);
+      }
+    };
+    
+    // 创建并打开弹窗
+    this.optionPickerDialogController = new CustomDialogController({
+      builder: OptionPickerDialog({
+        config: this.optionPickerDialogConfig
+      }),
+      alignment: DialogAlignment.Bottom,
+      customStyle: true,
+      backgroundColor: Color.Transparent
+    });
+    
+    this.optionPickerDialogController.open();
+  }
+  
+  /**
+   * 统一底部弹窗内容
+   */
+  @Builder
+  BottomSheetContent() {
+    if (this.bottomSheetType === 'resolution') {
+      this.CustomResolutionSheet()
+    } else {
+      this.TextInputSheet()
+    }
+  }
+
+  /**
+   * 文本输入弹窗
+   */
+  @Builder
+  TextInputSheet() {
+    Column({ space: AppSpacing.Large }) {
+      // 标题栏
+      Row() {
+        Text(this.textInputTitle)
+          .fontSize(AppSizes.FontTitle)
+          .fontWeight(FontWeight.Bold)
+          .fontColor(AppColors.TextPrimary)
+      }
+      .width('100%')
+      .padding({ top: AppSpacing.Large, left: AppSpacing.Large, right: AppSpacing.Large })
+      
+      // 输入框
+      TextInput({ text: this.textInputValue, placeholder: this.textInputPlaceholder })
+        .width('100%')
+        .height(48)
+        .fontSize(AppSizes.FontBody)
+        .fontColor(AppColors.TextPrimary)
+        .backgroundColor(AppColors.Surface)
+        .borderRadius(AppSizes.RadiusMedium)
+        .padding({ left: AppSpacing.Medium, right: AppSpacing.Medium })
+        .margin({ left: AppSpacing.Large, right: AppSpacing.Large })
+        .onChange((value: string) => {
+          this.textInputValue = value;
+        })
+      
+      // 按钮行
+      Row({ space: AppSpacing.Medium }) {
+        Button('清除')
+          .fontSize(AppSizes.FontBody)
+          .fontColor(AppColors.Error)
+          .backgroundColor(Color.Transparent)
+          .layoutWeight(1)
+          .height(48)
+          .onClick(() => {
+            this.textInputValue = '';
+            if (this.textInputCallback) {
+              this.textInputCallback('');
+            }
+            this.showTextInputDialog = false;
+          })
+        
+        Button('取消')
+          .fontSize(AppSizes.FontBody)
+          .fontColor(AppColors.TextSecondary)
+          .backgroundColor(Color.Transparent)
+          .layoutWeight(1)
+          .height(48)
+          .onClick(() => {
+            this.showTextInputDialog = false;
+          })
+        
+        Button('确定')
+          .fontSize(AppSizes.FontBody)
+          .fontColor(AppColors.TextOnPrimary)
+          .backgroundColor(AppColors.Primary)
+          .layoutWeight(1)
+          .height(48)
+          .borderRadius(AppSizes.RadiusMedium)
+          .onClick(() => {
+            if (this.textInputCallback) {
+              this.textInputCallback(this.textInputValue);
+            }
+            this.showTextInputDialog = false;
+          })
+      }
+      .width('100%')
+      .padding({ left: AppSpacing.Large, right: AppSpacing.Large, bottom: AppSpacing.Large })
+    }
+    .width('100%')
+    .backgroundColor(AppColors.CardBackground)
+    .borderRadius(24)
+  }
+
+  /**
+   * 计算宽高比的友好描述
+   */
+  private calcAspectRatio(w: number, h: number): string {
+    if (w <= 0 || h <= 0) return '';
+    const gcd = (a: number, b: number): number => b === 0 ? a : gcd(b, a % b);
+    const d = gcd(w, h);
+    const rw = w / d;
+    const rh = h / d;
+    // 常见宽高比映射
+    const ratio = w / h;
+    if (Math.abs(ratio - 16 / 9) < 0.02) return '16:9';
+    if (Math.abs(ratio - 16 / 10) < 0.02) return '16:10';
+    if (Math.abs(ratio - 21 / 9) < 0.05) return '21:9 超宽';
+    if (Math.abs(ratio - 32 / 9) < 0.05) return '32:9 超超宽';
+    if (Math.abs(ratio - 4 / 3) < 0.02) return '4:3';
+    if (Math.abs(ratio - 3 / 2) < 0.02) return '3:2';
+    if (Math.abs(ratio - 5 / 4) < 0.02) return '5:4';
+    return `${rw}:${rh}`;
+  }
+
+  /**
+   * 自定义分辨率输入弹窗 — 分离宽高输入 + 快捷预设
+   */
+  @Builder
+  CustomResolutionSheet() {
+    Column({ space: AppSpacing.Medium }) {
+      // 标题
+      Text('添加自定义分辨率')
+        .fontSize(AppSizes.FontTitle)
+        .fontWeight(FontWeight.Bold)
+        .fontColor(AppColors.TextPrimary)
+        .width('100%')
+        .padding({ top: AppSpacing.Large, left: AppSpacing.Large, right: AppSpacing.Large })
+
+      // 宽度 × 高度 输入行
+      Row({ space: AppSpacing.Small }) {
+        TextInput({ text: this.customResWidth, placeholder: '宽度' })
+          .type(InputType.Number)
+          .width(0)
+          .layoutWeight(1)
+          .height(48)
+          .fontSize(AppSizes.FontBody)
+          .fontColor(AppColors.TextPrimary)
+          .backgroundColor(AppColors.Surface)
+          .borderRadius(AppSizes.RadiusMedium)
+          .textAlign(TextAlign.Center)
+          .onChange((value: string) => {
+            this.customResWidth = value;
+            const w = parseInt(value) || 0;
+            const h = parseInt(this.customResHeight) || 0;
+            this.customResAspectRatio = this.calcAspectRatio(w, h);
+          })
+
+        Text('×')
+          .fontSize(20)
+          .fontColor(AppColors.TextSecondary)
+          .fontWeight(FontWeight.Bold)
+
+        TextInput({ text: this.customResHeight, placeholder: '高度' })
+          .type(InputType.Number)
+          .width(0)
+          .layoutWeight(1)
+          .height(48)
+          .fontSize(AppSizes.FontBody)
+          .fontColor(AppColors.TextPrimary)
+          .backgroundColor(AppColors.Surface)
+          .borderRadius(AppSizes.RadiusMedium)
+          .textAlign(TextAlign.Center)
+          .onChange((value: string) => {
+            this.customResHeight = value;
+            const w = parseInt(this.customResWidth) || 0;
+            const h = parseInt(value) || 0;
+            this.customResAspectRatio = this.calcAspectRatio(w, h);
+          })
+      }
+      .width('100%')
+      .padding({ left: AppSpacing.Large, right: AppSpacing.Large })
+
+      // 宽高比提示 + 验证提示
+      if (this.customResAspectRatio.length > 0) {
+        Text(`宽高比: ${this.customResAspectRatio}`)
+          .fontSize(AppSizes.FontCaption)
+          .fontColor(AppColors.Primary)
+          .width('100%')
+          .textAlign(TextAlign.Center)
+      }
+
+      // 常用分辨率快捷按钮
+      Text('快速选择')
+        .fontSize(AppSizes.FontCaption)
+        .fontColor(AppColors.TextSecondary)
+        .width('100%')
+        .padding({ left: AppSpacing.Large })
+
+      Flex({ wrap: FlexWrap.Wrap, justifyContent: FlexAlign.Start, space: { main: LengthMetrics.vp(8), cross: LengthMetrics.vp(8) } }) {
+        ForEach([
+          new ResolutionPreset('2K 超宽', '2560', '1080'),
+          new ResolutionPreset('QHD 超宽', '3440', '1440'),
+          new ResolutionPreset('1920×1200', '1920', '1200'),
+          new ResolutionPreset('2560×1600', '2560', '1600'),
+          new ResolutionPreset('1280×1024', '1280', '1024'),
+          new ResolutionPreset('5120×1440', '5120', '1440'),
+          new ResolutionPreset('5K', '5120', '2880'),
+          new ResolutionPreset('8K', '7680', '4320'),
+        ] as ResolutionPreset[], (item: ResolutionPreset) => {
+          Button(item.label)
+            .fontSize(AppSizes.FontCaption)
+            .fontColor(AppColors.TextPrimary)
+            .backgroundColor(AppColors.Surface)
+            .height(32)
+            .borderRadius(16)
+            .padding({ left: 12, right: 12 })
+            .onClick(() => {
+              this.customResWidth = item.w;
+              this.customResHeight = item.h;
+              const w = parseInt(item.w);
+              const h = parseInt(item.h);
+              this.customResAspectRatio = this.calcAspectRatio(w, h);
+            })
+        })
+      }
+      .width('100%')
+      .padding({ left: AppSpacing.Large, right: AppSpacing.Large })
+
+      // 按钮行
+      Row({ space: AppSpacing.Medium }) {
+        Button('取消')
+          .fontSize(AppSizes.FontBody)
+          .fontColor(AppColors.TextSecondary)
+          .backgroundColor(Color.Transparent)
+          .layoutWeight(1)
+          .height(48)
+          .onClick(() => {
+            this.showTextInputDialog = false;
+          })
+        
+        Button('添加')
+          .fontSize(AppSizes.FontBody)
+          .fontColor(AppColors.TextOnPrimary)
+          .backgroundColor(AppColors.Primary)
+          .layoutWeight(1)
+          .height(48)
+          .borderRadius(AppSizes.RadiusMedium)
+          .onClick(() => {
+            const w = this.customResWidth.trim();
+            const h = this.customResHeight.trim();
+            if (w.length > 0 && h.length > 0) {
+              this.addCustomResolution(`${w}x${h}`);
+            } else {
+              this.showToast('请输入宽度和高度');
+            }
+            this.showTextInputDialog = false;
+          })
+      }
+      .width('100%')
+      .padding({ left: AppSpacing.Large, right: AppSpacing.Large, bottom: AppSpacing.Large })
+    }
+    .width('100%')
+    .backgroundColor(AppColors.CardBackground)
+    .borderRadius(24)
+  }
+
+  build() {
+    NavDestination() {
+    Column() {
+      // 标题栏
+      if (this.isWideScreen) {
+        this.TitleBar()
+      } else {
+        GridRow({ columns: 12 }) {
+          GridCol({ span: { sm: 12, md: 10, lg: 8 }, offset: { sm: 0, md: 1, lg: 2 } }) {
+            this.TitleBar()
+          }
+        }
+      }
+      
+      // 宽屏：左导航 + 右内容 ；窄屏：垂直滚动列表
+      Row() {
+        if (this.isWideScreen) {
+          this.SettingsSidebar()
+        }
+        
+        // 设置列表
+        Scroll() {
+          GridRow({ columns: 12 }) {
+            GridCol({
+              span: this.isWideScreen ? 12 : { sm: 12, md: 10, lg: 8 },
+              offset: this.isWideScreen ? 0 : { sm: 0, md: 1, lg: 2 }
+            }) {
+              Column() {
+          // ═══════════ 普通设置（一进设置即可见） ═══════════
+          // 统一账号
+          this.SettingsGroup({
+            id: 'account',
+            icon: $r('sys.symbol.person_fill'),
+            title: '账号',
+            items: [
+              {
+                title: this.accountLoggedIn ? (this.accountDisplayName || '已登录') : '登录统一账号',
+                subtitle: this.accountLoggedIn
+                  ? (this.accountAuthorized ? '云端功能已开通' : '未开通云端功能，本地远控不受影响')
+                  : '登录后可绑定设备、使用云端功能',
+                type: 'action',
+                action: () => {
+                  if (!this.accountLoggedIn) {
+                    AppNav.push('AccountLoginPage');
+                  }
+                }
+              },
+              {
+                title: '我的设备',
+                subtitle: '查看登录过这个账号的设备，可从账号里删除',
+                type: 'action',
+                visible: this.accountLoggedIn,
+                action: () => {
+                  AppNav.push('AccountDevicesPage');
+                }
+              },
+              {
+                title: '配对记录',
+                subtitle: '退出账号后保留的历史配对，仅供查看',
+                type: 'action',
+                action: () => {
+                  AppNav.push('PairingRecordsPage');
+                }
+              },
+              {
+                title: '退出登录',
+                subtitle: '退出后账号同步来的电脑会从首页移除，配对过的留一条记录',
+                type: 'action',
+                visible: this.accountLoggedIn,
+                action: () => {
+                  this.logoutAccount();
+                }
+              }
+            ]
+          })
+
+          // 隐私管理
+          this.SettingsGroup({
+            id: 'privacy',
+            icon: $r('sys.symbol.lock_fill'),
+            title: '隐私管理',
+            items: [
+              {
+                title: '隐私屏',
+                subtitle: '远控期间关闭电脑屏幕，旁边的人看不到画面',
+                tooltip: '开启后：\n· 每次连接电脑，电脑显示器会自动变黑\n· 只有平板上能看到和操作电脑\n· 断开连接后，电脑屏幕会自动恢复亮起\n\n适合出门在外、旁边有人，或不想让别人看到屏幕内容时使用。\n关闭后：平板和电脑屏幕显示同样的画面。',
+                type: 'toggle',
+                value: this.privacyScreenEnabled,
+                action: () => {
+                  this.privacyScreenEnabled = !this.privacyScreenEnabled;
+                  this.saveSetting(SettingsKeys.PRIVACY_SCREEN_ENABLED, this.privacyScreenEnabled);
+                  // 关闭隐私时复位屏幕组合模式，避免「仅此屏」残留导致普通串流也关屏
+                  if (!this.privacyScreenEnabled && this.screenCombinationMode === '仅此屏幕') {
+                    this.screenCombinationMode = '主机默认';
+                    this.saveSetting(SettingsKeys.SCREEN_COMBINATION_MODE, '主机默认');
+                  }
+                }
+              }
+            ]
+          })
+
+          // 高级设置入口（仅窄屏显示；宽屏在左侧导航里折叠）
+          if (!this.isWideScreen) {
+            this.AdvancedSectionHeader()
+          }
+
+          // ═══════════ 高级设置（默认收起，主动展开才显示） ═══════════
+          if (this.advancedExpanded || this.isWideScreen) {
+          // 视频设置
+          this.SettingsGroup({
+            id: 'video',
+            icon: $r('sys.symbol.video_fill'),
+            title: '视频',
+            items: [
+              {
+                title: '分辨率',
+                subtitle: this.resolution === 'native'
+                  ? `本机 (${this.nativeWidth}×${this.nativeHeight})`
+                  : this.resolution,
+                type: 'select',
+                action: () => this.showResolutionPicker()
+              },
+              {
+                title: '帧率',
+                subtitle: this.fps.startsWith('自定义:') 
+                  ? `${this.fps.split(':')[1]} FPS (自定义)` 
+                  : this.fps,
+                type: 'select',
+                action: () => this.showFpsPicker()
+              },
+              {
+                title: '码率上限',
+                subtitle: this.bitrate === 0 
+                  ? `自动 (推荐: ${this.getRecommendedBitrateForCurrentSettings()} Mbps)` 
+                  : (this.bandwidthProbeEnabled || this.adaptiveBitrate)
+                    ? '自动选码率和动态调节的上限' : '视频传输比特率上限',
+                type: 'slider',
+                value: this.bitrate,
+                min: 1,  // 对数滑块最小值为1（0单独处理为"自动"）
+                max: 800,  // 最高800 Mbps，对齐Android
+                step: 1,
+                unit: ' Mbps',
+                isLogarithmic: true,  // 使用对数刻度，低码率精细调整，高码率粗调
+                // 常用码率吸附值（会自动在对数转换后应用）
+                snapValues: [5, 10, 15, 20, 30, 40, 50, 60, 80, 100, 120, 150, 200, 300, 400, 500],
+                snapThreshold: 8,  // 比例阈值 8%（对数滑块自动按比例计算吸附范围）
+                formatValue: (v: number) => v === 0 ? '自动' : `${Math.round(v)} Mbps`,
+                onSliderChange: (value: number) => {
+                  this.bitrate = value;
+                  this.saveSetting(SettingsKeys.BITRATE, value);
+                }
+              },
+              {
+                title: '开流前自动选码率',
+                subtitle: this.bandwidthProbeEnabled ? '连接前预估带宽，自动选择初始码率' : '关闭后直接使用码率上限',
+                type: 'toggle',
+                value: this.bandwidthProbeEnabled,
+                action: () => {
+                  this.bandwidthProbeEnabled = !this.bandwidthProbeEnabled;
+                  this.saveSetting(SettingsKeys.BANDWIDTH_PROBE_ENABLED, this.bandwidthProbeEnabled);
+                }
+              },
+              {
+                title: '允许计费网络测速',
+                subtitle: '允许在蜂窝或计费网络传输最多 ' +
+                  (METERED_BANDWIDTH_PROBE_MAX_BYTES / 1024).toString() + ' KiB 探测数据',
+                type: 'toggle',
+                value: this.meteredBandwidthProbeEnabled,
+                visible: this.bandwidthProbeEnabled,
+                action: () => {
+                  this.meteredBandwidthProbeEnabled = !this.meteredBandwidthProbeEnabled;
+                  this.saveSetting(SettingsKeys.METERED_BANDWIDTH_PROBE_ENABLED,
+                    this.meteredBandwidthProbeEnabled);
+                }
+              },
+              {
+                title: '串流中自动调节码率',
+                subtitle: this.adaptiveBitrate ? '根据网络状况自动调节码率，不超过码率上限' : '关闭后使用固定码率',
+                tooltip: '实时上报丢包率、延迟、帧率等网络指标，由本地 PID 控制器自动调节码率；连接基地阳光的米塔智能体时，服务端 LLM 可综合游戏类型和画面复杂度给出更精准的码率推荐',
+                type: 'toggle',
+                value: this.adaptiveBitrate,
+                action: () => {
+                  this.adaptiveBitrate = !this.adaptiveBitrate;
+                  this.saveSetting(SettingsKeys.ADAPTIVE_BITRATE, this.adaptiveBitrate);
+                }
+              },
+              {
+                title: '主机分辨率缩放',
+                subtitle: '按所选串流分辨率调整主机渲染分辨率',
+                type: 'slider',
+                value: this.hostScale,
+                min: 50,   // Android: 50-400%, step 10
+                max: 400,
+                step: 10,
+                unit: '%',
+                // 常用缩放比例吸附值
+                snapValues: [50, 75, 100, 125, 150, 200, 300, 400],
+                snapThreshold: 5,
+                formatValue: (v: number) => `${v}%`,
+                onSliderChange: (value: number) => {
+                  this.hostScale = value;
+                  this.saveSetting(SettingsKeys.HOST_SCALE, value);
+                }
+              },
+              {
+                title: '视频格式',
+                type: 'segment',
+                value: this.videoFormat,
+                segmentLabels: ['自动', 'H.264', 'HEVC', 'AV1'],
+                onSegmentChange: (value: string) => {
+                  if ((value === 'HEVC' && !(this.decoderCapabilities?.supportsHEVC)) ||
+                      (value === 'AV1' && !(this.decoderCapabilities?.supportsAV1)) ||
+                      (value === 'H.264' && !(this.decoderCapabilities?.supportsH264 ?? true))) {
+                    this.showToast(`警告: 设备不支持 ${value}，串流可能失败`, 3000);
+                  }
+                  this.videoFormat = value;
+                  this.saveSetting(SettingsKeys.VIDEO_FORMAT, value);
+                  if (value === 'H.264' && this.enableHdr) {
+                    this.enableHdr = false;
+                    this.hdrBrightnessOverride = false;
+                    this.saveSetting(SettingsKeys.ENABLE_HDR, false);
+                    this.saveSetting(SettingsKeys.HDR_BRIGHTNESS_OVERRIDE, false);
+                    this.showToast('H.264 不支持 HDR，已自动关闭');
+                  }
+                }
+              },
+              {
+                title: '串流 HDR',
+                subtitle: this.videoFormat === 'H.264' 
+                  ? 'H.264 不支持 HDR' 
+                  : '需要支持 HDR 的显示器',
+                type: 'toggle',
+                value: this.enableHdr,
+                disabled: this.videoFormat === 'H.264',
+                action: () => {
+                  if (this.videoFormat === 'H.264') {
+                    this.showToast('H.264 编码不支持 HDR，请选择 HEVC 或 AV1');
+                    return;
+                  }
+                  this.enableHdr = !this.enableHdr;
+                  this.saveSetting(SettingsKeys.ENABLE_HDR, this.enableHdr);
+                  if (!this.enableHdr && this.hdrBrightnessOverride) {
+                    this.hdrBrightnessOverride = false;
+                    this.saveSetting(SettingsKeys.HDR_BRIGHTNESS_OVERRIDE, false);
+                  }
+                }
+              },
+              {
+                title: 'HDR 模式',
+                tooltip: this.hdrMode === 'HLG'
+                  ? 'HLG (Hybrid Log-Gamma)\n• 需要 Sunshine Foundation 版本\n• 无需色调映射，亮度更自然\n• 兼容 HDR Vivid 显示设备'
+                  : 'HDR10 (PQ)\n• 兼容所有主流串流服务端\n• 使用 PQ 传输曲线，高亮细节更丰富\n• 部分设备可能出现偏暗',
+                type: 'segment',
+                value: this.hdrMode,
+                visible: this.enableHdr,
+                disabled: this.videoFormat === 'H.264' || !this.enableHdr,
+                segmentLabels: ['HDR10 (PQ)', 'HLG'],
+                segmentValues: ['HDR10', 'HLG'],
+                onSegmentChange: (value: string) => {
+                  this.hdrMode = value;
+                  this.saveSetting(SettingsKeys.HDR_MODE, value);
+                }
+              },
+              {
+                title: '本机 HDR 屏幕增亮',
+                subtitle: this.videoFormat === 'H.264'
+                  ? '需要 HEVC/AV1'
+                  : '提高本机屏幕亮度，与上报给主机的峰值亮度无关',
+                type: 'toggle',
+                visible: this.enableHdr,
+                value: this.enableHdrHighBrightness,
+                disabled: this.videoFormat === 'H.264' || !this.enableHdr,
+                action: () => {
+                  if (this.videoFormat === 'H.264') {
+                    this.showToast('H.264 编码不支持 HDR');
+                    return;
+                  }
+                  this.enableHdrHighBrightness = !this.enableHdrHighBrightness;
+                  this.saveSetting(SettingsKeys.ENABLE_HDR_HIGH_BRIGHTNESS, this.enableHdrHighBrightness);
+                }
+              },
+              {
+                title: 'HDR 峰值亮度校准',
+                subtitle: this.hdrBrightnessOverride
+                  ? '向主机上报 ' + this.hdrPeakBrightnessNits.toString() + ' nits，重新连接后生效'
+                  : '自动测量本机亮度；过曝或偏暗时可手动指定上报值',
+                type: 'toggle',
+                visible: this.enableHdr,
+                value: this.hdrBrightnessOverride,
+                disabled: this.videoFormat === 'H.264' || !this.enableHdr,
+                action: () => {
+                  if (this.videoFormat === 'H.264') {
+                    this.showToast('H.264 编码不支持 HDR');
+                    return;
+                  }
+                  this.hdrBrightnessOverride = !this.hdrBrightnessOverride;
+                  this.saveSetting(SettingsKeys.HDR_BRIGHTNESS_OVERRIDE, this.hdrBrightnessOverride);
+                }
+              },
+              {
+                title: 'HDR 峰值亮度（上报主机）',
+                subtitle: '告知主机本机屏幕的最高亮度，不改变屏幕实际亮度',
+                type: 'slider',
+                visible: this.enableHdr && this.hdrBrightnessOverride,
+                value: this.hdrPeakBrightnessNits,
+                min: 300,
+                max: 4000,
+                step: 50,
+                unit: ' nits',
+                disabled: this.videoFormat === 'H.264' || !this.enableHdr || !this.hdrBrightnessOverride,
+                snapValues: [300, 500, 800, 1000, 1500, 2000, 4000],
+                snapThreshold: 25,
+                formatValue: (v: number) => v.toString() + ' nits',
+                onSliderChange: (value: number) => {
+                  this.hdrPeakBrightnessNits = value;
+                  this.saveSetting(SettingsKeys.HDR_PEAK_BRIGHTNESS_NITS, value);
+                }
+              },
+              {
+                title: '画面拉伸',
+                subtitle: '拉伸画面以填满屏幕',
+                type: 'toggle',
+                value: this.stretchVideo,
+                action: () => {
+                  this.stretchVideo = !this.stretchVideo;
+                  this.saveSetting(SettingsKeys.STRETCH_VIDEO, this.stretchVideo);
+                }
+              },
+              {
+                title: '画面位置',
+                subtitle: '非全屏分辨率时画面在屏幕上的位置',
+                type: 'grid',
+                visible: !this.stretchVideo,
+                value: this.screenPosition,
+                gridLabels: ['左上', '上', '右上', '左', '居中', '右', '左下', '下', '右下'],
+                gridValues: ['左上', '上', '右上', '左', '居中', '右', '左下', '下', '右下'],
+                gridColumns: 3,
+                onGridSelect: (value: string) => {
+                  this.screenPosition = value;
+                  this.saveSetting(SettingsKeys.SCREEN_POSITION, value);
+                }
+              },
+              {
+                title: '水平偏移',
+                subtitle: '画面水平方向偏移',
+                type: 'slider',
+                visible: !this.stretchVideo,
+                value: this.screenOffsetX,
+                min: -100,
+                max: 100,
+                step: 1,
+                unit: '%',
+                snapValues: [0],
+                snapThreshold: 3,
+                formatValue: (v: number) => `${v}%`,
+                onSliderChange: (value: number) => {
+                  this.screenOffsetX = value;
+                  this.saveSetting(SettingsKeys.SCREEN_OFFSET_X, value);
+                }
+              },
+              {
+                title: '垂直偏移',
+                subtitle: '画面垂直方向偏移',
+                type: 'slider',
+                visible: !this.stretchVideo,
+                value: this.screenOffsetY,
+                min: -100,
+                max: 100,
+                step: 1,
+                unit: '%',
+                snapValues: [0],
+                snapThreshold: 3,
+                formatValue: (v: number) => `${v}%`,
+                onSliderChange: (value: number) => {
+                  this.screenOffsetY = value;
+                  this.saveSetting(SettingsKeys.SCREEN_OFFSET_Y, value);
+                }
+              },
+              {
+                title: '全范围色彩',
+                subtitle: this.enableHdr
+                  ? 'HDR 模式下需与服务端编码范围一致'
+                  : '使用完整色彩范围（0–255）',
+                tooltip: '仅在服务端与解码器均使用全范围时开启；范围不一致会导致黑位或高光异常',
+                type: 'toggle',
+                value: this.fullRange,
+                action: () => {
+                  this.fullRange = !this.fullRange;
+                  this.saveSetting(SettingsKeys.FULL_RANGE, this.fullRange);
+                }
+              },
+              {
+                title: '反转分辨率',
+                subtitle: '交换宽度和高度',
+                type: 'toggle',
+                value: this.reverseResolution,
+                action: () => {
+                  this.reverseResolution = !this.reverseResolution;
+                  this.saveSetting(SettingsKeys.REVERSE_RESOLUTION, this.reverseResolution);
+                }
+              },
+              {
+                title: '可旋转屏幕',
+                subtitle: '允许屏幕旋转',
+                tooltip: '需要 Sunshine Foundation + 虚拟显示器\n开启后串流中可自由旋转屏幕，主机会通过虚拟显示器同步切换分辨率',
+                type: 'toggle',
+                value: this.rotableScreen,
+                action: () => {
+                  this.rotableScreen = !this.rotableScreen;
+                  this.saveSetting(SettingsKeys.ROTABLE_SCREEN, this.rotableScreen);
+                }
+              }
+            ]
+          })
+          
+          // 音频设置
+          this.SettingsGroup({
+            id: 'audio',
+            icon: $r('sys.symbol.speaker_wave_2_fill'),
+            title: '音频',
+            items: [
+              {
+                title: '音频配置',
+                tooltip: '选「5.1 / 7.1 环绕」后打开空间音频选项系统会把多声道下混成空间音频~\n即刻就能感受到身临其境的环绕声效果',
+                type: 'segment',
+                value: this.audioConfig,
+                segmentLabels: ['立体声', '5.1 环绕', '7.1 环绕'],
+                onSegmentChange: (value: string) => {
+                  this.audioConfig = value;
+                  this.saveSetting(SettingsKeys.AUDIO_CONFIG, value);
+                }
+              },
+              {
+                title: '主机同时播放音频',
+                subtitle: '同时在主机上播放音频',
+                type: 'toggle',
+                value: this.enableLocalAudio,
+                action: () => {
+                  this.enableLocalAudio = !this.enableLocalAudio;
+                  this.saveSetting(SettingsKeys.ENABLE_LOCAL_AUDIO, this.enableLocalAudio);
+                }
+              },
+              {
+                title: '空间音频',
+                subtitle: '启用空间音频效果（需系统支持）',
+                type: 'toggle',
+                value: this.enableSpatializer,
+                action: () => {
+                  this.enableSpatializer = !this.enableSpatializer;
+                  this.saveSetting(SettingsKeys.ENABLE_SPATIALIZER, this.enableSpatializer);
+                }
+              },
+              {
+                title: '音频兼容模式',
+                subtitle: '如果音频卡顿可尝试开启（增大缓冲区）',
+                type: 'toggle',
+                value: this.audioCompatMode,
+                action: () => {
+                  this.audioCompatMode = !this.audioCompatMode;
+                  this.saveSetting(SettingsKeys.AUDIO_COMPAT_MODE, this.audioCompatMode);
+                }
+              },
+              {
+                title: '启用麦克风',
+                subtitle: this.developerMode ? '将麦克风音频传输到主机' : '需要开发者模式',
+                type: 'toggle',
+                value: this.enableMic,
+                isPro: true,
+                disabled: !this.developerMode,
+                action: () => {
+                  if (this.developerMode) {
+                    this.enableMic = !this.enableMic;
+                    this.saveSetting(SettingsKeys.ENABLE_MIC, this.enableMic);
+                  }
+                }
+              },
+              {
+                title: '麦克风码率',
+                subtitle: this.developerMode ? '麦克风传输比特率' : '需要开发者模式',
+                type: 'slider',
+                visible: this.enableMic,
+                value: this.micBitrate,
+                min: 16,
+                max: 256,
+                step: 16,
+                unit: ' kbps',
+                isPro: true,
+                disabled: !this.developerMode,
+                onSliderChange: (value: number) => {
+                  if (this.developerMode) {
+                    this.micBitrate = value;
+                    this.saveSetting(SettingsKeys.MIC_BITRATE, value);
+                  }
+                }
+              }
+            ]
+          })
+
+          // 振动设置：游戏振动与音频触感汇入同一组执行器，集中配置
+          this.SettingsGroup({
+            id: 'vibration',
+            icon: $r('sys.symbol.waveform'),
+            title: '振动',
+            items: [
+              {
+                title: '振动反馈',
+                subtitle: '串流游戏振动反馈',
+                type: 'toggle',
+                value: this.enableVibration,
+                action: () => {
+                  this.enableVibration = !this.enableVibration;
+                  this.saveSetting(SettingsKeys.ENABLE_VIBRATION, this.enableVibration);
+                }
+              },
+              {
+                title: '振动强度',
+                subtitle: this.gameVibrationStrength > GAME_VIBRATION_STRENGTH_ORIGINAL ?
+                  '超过 100% 为 app 侧放大，不突破系统/硬件上限' :
+                  '串流游戏振动强度，100% 为原始强度',
+                type: 'slider',
+                visible: this.enableVibration,
+                value: this.gameVibrationStrength,
+                min: GAME_VIBRATION_STRENGTH_MIN,
+                max: GAME_VIBRATION_STRENGTH_MAX,
+                step: GAME_VIBRATION_STRENGTH_STEP,
+                unit: '%',
+                onSliderChange: (value: number) => {
+                  this.gameVibrationStrength = normalizeGameVibrationStrength(value);
+                  this.saveSetting(SettingsKeys.VIBRATE_FALLBACK_STRENGTH, this.gameVibrationStrength);
+                }
+              },
+              {
+                title: '音频振动',
+                subtitle: '根据游戏音频低频内容驱动振动',
+                type: 'toggle',
+                value: this.enableAudioVibration,
+                action: () => {
+                  this.enableAudioVibration = !this.enableAudioVibration;
+                  this.saveSetting(SettingsKeys.ENABLE_AUDIO_VIBRATION, this.enableAudioVibration);
+                }
+              },
+              {
+                title: '音频振动强度',
+                subtitle: '低频触发振动的强度',
+                type: 'slider',
+                visible: this.enableAudioVibration,
+                value: this.audioVibrationStrength,
+                min: 10,
+                max: 100,
+                step: 5,
+                unit: '%',
+                onSliderChange: (value: number) => {
+                  this.audioVibrationStrength = value;
+                  this.saveSetting(SettingsKeys.AUDIO_VIBRATION_STRENGTH, value);
+                }
+              },
+              {
+                title: '音频振动场景',
+                type: 'segment',
+                value: this.audioVibrationSceneMode,
+                visible: this.enableAudioVibration,
+                segmentLabels: ['游戏/电影', '音乐/节奏', '自动'],
+                onSegmentChange: (value: string) => {
+                  this.audioVibrationSceneMode = value;
+                  this.saveSetting(SettingsKeys.AUDIO_VIBRATION_SCENE_MODE, value);
+                }
+              },
+              {
+                title: '振动模式',
+                subtitle: this.getVibrationModeSubtitle(),
+                type: 'segment',
+                value: this.vibrationMode,
+                visible: this.enableVibration || this.enableAudioVibration,
+                segmentLabels: ['自动', '仅手柄', '仅设备', '协同'],
+                onSegmentChange: (value: string) => {
+                  this.vibrationMode = value;
+                  this.saveSetting(SettingsKeys.VIBRATION_MODE, value);
+                }
+              }
+            ]
+          })
+
+          // 手柄设置
+          this.SettingsGroup({
+            id: 'gamepad',
+            icon: $r('sys.symbol.gamecontroller_fill'),
+            title: '手柄',
+            items: [
+              {
+                title: '多手柄输入',
+                subtitle: '允许多个手柄同时输入',
+                type: 'toggle',
+                value: this.multiController,
+                action: () => {
+                  this.multiController = !this.multiController;
+                  this.saveSetting(SettingsKeys.MULTI_CONTROLLER, this.multiController);
+                }
+              },
+              {
+                title: '翻转 A/B X/Y',
+                subtitle: '交换确认和取消按钮',
+                type: 'toggle',
+                value: this.flipFaceButtons,
+                action: () => {
+                  this.flipFaceButtons = !this.flipFaceButtons;
+                  this.saveSetting(SettingsKeys.FLIP_FACE_BUTTONS, this.flipFaceButtons);
+                }
+              },
+              {
+                title: '摇杆死区',
+                subtitle: '摇杆输入死区',
+                type: 'slider',
+                value: this.deadzone,
+                min: 0,
+                max: 50,
+                step: 1,
+                unit: '%',
+                onSliderChange: (value: number) => {
+                  this.deadzone = value;
+                  this.saveSetting(SettingsKeys.DEADZONE, value);
+                }
+              },
+              {
+                title: '手柄运动传感器',
+                subtitle: '把手柄的陀螺仪数据转发给主机（游戏需支持体感）',
+                type: 'toggle',
+                value: this.gamepadMotionSensors,
+                action: () => {
+                  this.gamepadMotionSensors = !this.gamepadMotionSensors;
+                  this.saveSetting(SettingsKeys.GAMEPAD_MOTION_SENSORS, this.gamepadMotionSensors);
+                }
+              },
+              {
+                title: '体感助手',
+                subtitle: '本机陀螺仪直接操控右摇杆，无需游戏支持体感',
+                type: 'toggle',
+                value: this.gyroAssistEnabled,
+                action: () => {
+                  this.gyroAssistEnabled = !this.gyroAssistEnabled;
+                  this.saveSetting(SettingsKeys.GYRO_ASSIST_ENABLED, this.gyroAssistEnabled);
+                }
+              },
+              {
+                title: '体感灵敏度',
+                subtitle: '倍率越高，越小的旋转幅度即可满偏',
+                type: 'slider',
+                visible: this.gyroAssistEnabled,
+                value: this.gyroSensitivity,
+                min: GYRO_SENSITIVITY_MIN,
+                max: GYRO_SENSITIVITY_MAX,
+                step: 0.1,
+                formatValue: (v: number) => `${v.toFixed(1)}x`,
+                onSliderChange: (value: number) => {
+                  this.gyroSensitivity = Math.round(value * 10) / 10;
+                  this.saveSetting(SettingsKeys.GYRO_SENSITIVITY, this.gyroSensitivity);
+                }
+              },
+              {
+                title: '体感 X 轴反转',
+                type: 'toggle',
+                visible: this.gyroAssistEnabled,
+                value: this.gyroInvertX,
+                action: () => {
+                  this.gyroInvertX = !this.gyroInvertX;
+                  this.saveSetting(SettingsKeys.GYRO_INVERT_X, this.gyroInvertX);
+                }
+              },
+              {
+                title: '体感 Y 轴反转',
+                type: 'toggle',
+                visible: this.gyroAssistEnabled,
+                value: this.gyroInvertY,
+                action: () => {
+                  this.gyroInvertY = !this.gyroInvertY;
+                  this.saveSetting(SettingsKeys.GYRO_INVERT_Y, this.gyroInvertY);
+                }
+              },
+              {
+                title: '体感激活方式',
+                subtitle: '常开，或按住扳机时启用',
+                type: 'segment',
+                visible: this.gyroAssistEnabled,
+                value: String(this.gyroActivationKey),
+                segmentLabels: ['常开', 'LT', 'RT'],
+                segmentValues: ['-1', '0', '1'],
+                onSegmentChange: (value: string) => {
+                  this.gyroActivationKey = Math.round(Number(value));
+                  this.saveSetting(SettingsKeys.GYRO_ACTIVATION_KEY, this.gyroActivationKey);
+                }
+              },
+              {
+                title: '设备运动传感器回退',
+                subtitle: '手柄没有体感时，用本机传感器数据顶替转发',
+                type: 'toggle',
+                visible: this.gamepadMotionSensors,
+                value: this.gamepadMotionFallback,
+                action: () => {
+                  this.gamepadMotionFallback = !this.gamepadMotionFallback;
+                  this.saveSetting(SettingsKeys.GAMEPAD_MOTION_FALLBACK, this.gamepadMotionFallback);
+                }
+              },
+              {
+                title: '手柄触摸板作鼠标',
+                subtitle: 'DualSense/DS4 触摸板模拟鼠标（需 USB 驱动）',
+                type: 'toggle',
+                value: this.gamepadTouchpadMouse,
+                action: () => {
+                  this.gamepadTouchpadMouse = !this.gamepadTouchpadMouse;
+                  this.saveSetting(SettingsKeys.GAMEPAD_TOUCHPAD_MOUSE, this.gamepadTouchpadMouse);
+                }
+              },
+              {
+                title: '长按 Start 菜单',
+                subtitle: '长按 Start 键显示菜单',
+                type: 'toggle',
+                value: this.enableStartKeyMenu,
+                action: () => {
+                  this.enableStartKeyMenu = !this.enableStartKeyMenu;
+                  this.saveSetting(SettingsKeys.ENABLE_START_KEY_MENU, this.enableStartKeyMenu);
+                }
+              },
+              {
+                title: '按键反劫持',
+                subtitle: '拦截部分蓝牙手柄 Guide/Mode 键退出 App（需系统级签名，否则可能无效）',
+                type: 'toggle',
+                value: this.enableKeyInterceptor,
+                visible: this.keyInterceptorAvailable,
+                action: () => {
+                  this.enableKeyInterceptor = !this.enableKeyInterceptor;
+                  this.saveSetting(SettingsKeys.ENABLE_KEY_INTERCEPTOR, this.enableKeyInterceptor);
+                }
+              },
+              {
+                title: 'Guide/Mode 键动作',
+                subtitle: this.getHomeButtonActionDescription(),
+                type: 'select',
+                value: this.gcButtonHomeMapping,
+                action: () => {
+                  this.showHomeButtonActionPicker();
+                }
+              }
+            ]
+          })
+          
+          // USB 手柄驱动
+          this.SettingsGroup({
+            id: 'usb_driver',
+            icon: $r('sys.symbol.charg_cable'),
+            title: 'USB 驱动',
+            items: [
+              {
+                title: 'USB 手柄振动与 LED',
+                subtitle: '启用 USB 手柄的振动和 LED 等高级功能。手柄输入仍由系统统一处理',
+                type: 'toggle',
+                value: this.usbDriverEnabled,
+                action: () => {
+                  this.usbDriverEnabled = !this.usbDriverEnabled;
+                  this.saveSetting(SettingsKeys.USB_DRIVER_ENABLED, this.usbDriverEnabled);
+                  // 关闭 USB 驱动时，同步关闭强制模式
+                  if (!this.usbDriverEnabled && this.forceUsbDriverOnly) {
+                    this.forceUsbDriverOnly = false;
+                    this.saveSetting(SettingsKeys.FORCE_USB_DRIVER_ONLY, false);
+                  }
+                  ToastQueue.show({
+                    message: '下次串流时生效',
+                    duration: 2500
+                  });
+                }
+              },
+              {
+                title: '强制 USB 驱动接管输入',
+                subtitle: '禁用系统手柄服务（GCK），由 USB 驱动直接处理输入。适用于 GCK 兼容性差的手柄，也可在串流菜单中临时切换',
+                type: 'toggle',
+                value: this.forceUsbDriverOnly,
+                visible: this.usbDriverEnabled,
+                action: () => {
+                  this.forceUsbDriverOnly = !this.forceUsbDriverOnly;
+                  this.saveSetting(SettingsKeys.FORCE_USB_DRIVER_ONLY, this.forceUsbDriverOnly);
+                  ToastQueue.show({
+                    message: '下次串流时生效',
+                    duration: 2500
+                  });
+                }
+              },
+              {
+                title: 'USB 驱动高速轮询',
+                subtitle: '使用 DDK 内核级轮询降低输入延迟，但部分手柄（如 Razer）可能出现振动失效。关闭后使用标准 USB 通道',
+                type: 'toggle',
+                value: this.ddkHighSpeedPolling,
+                visible: this.usbDriverEnabled,
+                action: () => {
+                  this.ddkHighSpeedPolling = !this.ddkHighSpeedPolling;
+                  this.saveSetting(SettingsKeys.DDK_HIGH_SPEED_POLLING, this.ddkHighSpeedPolling);
+                  ToastQueue.show({
+                    message: '下次串流时生效',
+                    duration: 2500
+                  });
+                }
+              },
+              {
+                title: 'USB 直通主机（实验）',
+                subtitle: '通过 OTG 连接的手柄经 USB/IP 反向隧道直通到 Sunshine 主机，作为原生 USB 设备工作（陀螺仪、触控板完整支持）。需 Sunshine 开启 USB 转发并安装 usbip-win2 驱动，每次串流转发一个手柄',
+                type: 'toggle',
+                value: this.usbForwardingEnabled,
+                action: () => {
+                  this.usbForwardingEnabled = !this.usbForwardingEnabled;
+                  this.saveSetting(SettingsKeys.USB_FORWARDING_ENABLED, this.usbForwardingEnabled);
+                  ToastQueue.show({
+                    message: '下次串流时生效',
+                    duration: 2500
+                  });
+                }
+              },
+              {
+                title: '手柄测试',
+                subtitle: '测试 USB 和蓝牙/系统手柄',
+                type: 'action',
+                action: () => {
+                  AppNav.push('ControllerTestPage');
+                }
+              }
+            ]
+          })
+          
+          // 屏幕控制器设置
+          this.SettingsGroup({
+            id: 'osc',
+            icon: $r('sys.symbol.gamecontroller'),
+            title: '屏幕控制器',
+            items: [
+              {
+                title: '显示屏幕控制器',
+                subtitle: '显示虚拟游戏手柄',
+                type: 'toggle',
+                value: this.enableOnscreenControls,
+                action: () => {
+                  this.enableOnscreenControls = !this.enableOnscreenControls;
+                  this.saveSetting(SettingsKeys.ENABLE_ONSCREEN_CONTROLS, this.enableOnscreenControls);
+                }
+              },
+              {
+                title: '显示屏幕键盘',
+                subtitle: '显示虚拟键盘按钮',
+                type: 'toggle',
+                value: this.enableOnscreenKeyboard,
+                action: () => {
+                  this.enableOnscreenKeyboard = !this.enableOnscreenKeyboard;
+                  this.saveSetting(SettingsKeys.ENABLE_ONSCREEN_KEYBOARD, this.enableOnscreenKeyboard);
+                }
+              },
+              {
+                title: '仅 L3/R3 按钮',
+                subtitle: '只显示 L3 和 R3 按钮',
+                type: 'toggle',
+                visible: this.enableOnscreenControls,
+                value: this.onlyL3R3,
+                action: () => {
+                  this.onlyL3R3 = !this.onlyL3R3;
+                  this.saveSetting(SettingsKeys.ONLY_L3_R3, this.onlyL3R3);
+                }
+              },
+              {
+                title: '显示 Guide 按钮',
+                subtitle: '显示主页/Guide 按钮',
+                type: 'toggle',
+                visible: this.enableOnscreenControls,
+                value: this.showGuideButton,
+                action: () => {
+                  this.showGuideButton = !this.showGuideButton;
+                  this.saveSetting(SettingsKeys.SHOW_GUIDE_BUTTON, this.showGuideButton);
+                }
+              },
+              {
+                title: '竖屏半高模式',
+                subtitle: '竖屏时控制器显示在下半屏',
+                type: 'toggle',
+                visible: this.enableOnscreenControls,
+                value: this.halfHeightOscPortrait,
+                action: () => {
+                  this.halfHeightOscPortrait = !this.halfHeightOscPortrait;
+                  this.saveSetting(SettingsKeys.HALF_HEIGHT_OSC_PORTRAIT, this.halfHeightOscPortrait);
+                }
+              },
+              {
+                title: '控制器透明度',
+                subtitle: '虚拟控制器不透明度',
+                type: 'slider',
+                visible: this.enableOnscreenControls,
+                value: this.oscOpacity,
+                min: 10,
+                max: 100,
+                step: 5,
+                unit: '%',
+                onSliderChange: (value: number) => {
+                  this.oscOpacity = value;
+                  this.saveSetting(SettingsKeys.OSC_OPACITY, value);
+                }
+              },
+              {
+                title: '屏幕控制器振动',
+                subtitle: '按下按钮时振动',
+                type: 'toggle',
+                visible: this.enableOnscreenControls,
+                value: this.vibrateOsc,
+                action: () => {
+                  this.vibrateOsc = !this.vibrateOsc;
+                  this.saveSetting(SettingsKeys.VIBRATE_OSC, this.vibrateOsc);
+                }
+              }
+            ]
+          })
+          
+          // 鼠标和触控设置
+          this.SettingsGroup({
+            id: 'mouse',
+            icon: $r('sys.symbol.mouse'),
+            title: '鼠标和触控',
+            items: [
+              {
+                title: '显示本地光标',
+                subtitle: '保持系统光标可见',
+                type: 'toggle',
+                value: this.showLocalCursor,
+                action: () => {
+                  this.showLocalCursor = !this.showLocalCursor;
+                  this.saveSetting(SettingsKeys.SHOW_LOCAL_CURSOR, this.showLocalCursor);
+                }
+              },
+              {
+                title: '触屏作为触控板',
+                subtitle: '触摸屏幕模拟触控板',
+                type: 'toggle',
+                value: this.touchscreenTrackpad,
+                action: () => {
+                  this.touchscreenTrackpad = !this.touchscreenTrackpad;
+                  this.saveSetting(SettingsKeys.TOUCHSCREEN_TRACKPAD, this.touchscreenTrackpad);
+                  // 清除菜单中选择的触摸模式，使设置页的选项在下次串流时生效
+                  this.saveSetting(SettingsKeys.LAST_TOUCH_MODE, '');
+                }
+              },
+              {
+                title: '三指唤出输入法',
+                subtitle: '三指同时触摸时打开系统输入法，关闭后触摸将发送到主机',
+                type: 'toggle',
+                value: this.enableThreeFingerIme,
+                action: () => {
+                  this.enableThreeFingerIme = !this.enableThreeFingerIme;
+                  this.saveSetting(SettingsKeys.ENABLE_THREE_FINGER_IME, this.enableThreeFingerIme);
+                }
+              },
+              {
+                title: '低延迟触摸参数',
+                subtitle: '缩短触摸点击确认和释放等待，响应更快但更敏感',
+                type: 'toggle',
+                value: this.lowLatencyTouch,
+                action: () => {
+                  this.lowLatencyTouch = !this.lowLatencyTouch;
+                  this.saveSetting(SettingsKeys.LOW_LATENCY_TOUCH, this.lowLatencyTouch);
+                }
+              },
+              {
+                title: '双击拖动',
+                subtitle: '双击并按住可拖动',
+                type: 'toggle',
+                value: this.enableDoubleClickDrag,
+                action: () => {
+                  this.enableDoubleClickDrag = !this.enableDoubleClickDrag;
+                  this.saveSetting(SettingsKeys.ENABLE_DOUBLE_CLICK_DRAG, this.enableDoubleClickDrag);
+                }
+              },
+              {
+                title: '双击时间阈值',
+                subtitle: '双击判定时间间隔',
+                type: 'slider',
+                visible: this.enableDoubleClickDrag,
+                value: this.doubleTapTimeThreshold,
+                min: 100,
+                max: 500,
+                step: 50,
+                unit: ' ms',
+                onSliderChange: (value: number) => {
+                  this.doubleTapTimeThreshold = value;
+                  this.saveSetting(SettingsKeys.DOUBLE_TAP_TIME_THRESHOLD, value);
+                }
+              },
+              {
+                title: '鼠标导航按钮',
+                subtitle: '启用鼠标前进/后退按钮',
+                type: 'toggle',
+                value: this.mouseNavButtons,
+                action: () => {
+                  this.mouseNavButtons = !this.mouseNavButtons;
+                  this.saveSetting(SettingsKeys.MOUSE_NAV_BUTTONS, this.mouseNavButtons);
+                }
+              },
+              {
+                title: '游戏鼠标模式',
+                subtitle: '相对输入+光标回弹，适合 FPS/TPS 游戏。搭配 Foundation Sunshine 的鼠标驱动效果更佳',
+                type: 'toggle',
+                value: this.gameMouseMode,
+                action: () => {
+                  this.gameMouseMode = !this.gameMouseMode;
+                  this.saveSetting(SettingsKeys.GAME_MOUSE_MODE, this.gameMouseMode);
+                }
+              }
+            ]
+          })
+          
+          // 主机设置
+          this.SettingsGroup({
+            id: 'host',
+            icon: $r('sys.symbol.computer_host_fill'),
+            title: '主机',
+            items: [
+              {
+                title: 'NVIDIA 游戏优化',
+                subtitle: '让兼容的 NVIDIA 服务端自动优化游戏设置',
+                type: 'toggle',
+                value: this.enableSops,
+                action: () => {
+                  this.enableSops = !this.enableSops;
+                  this.saveSetting(SettingsKeys.ENABLE_SOPS, this.enableSops);
+                }
+              },
+              {
+                title: '屏幕组合模式',
+                tooltip: '· 主机默认：使用 Sunshine 服务端配置\n· 不修改：保持当前屏幕布局不变\n· 确保开启：确保串流屏幕已点亮\n· 设为主屏：将串流屏幕设为主显示器\n· 仅此屏幕：仅使用串流屏幕，关闭其他显示器',
+                type: 'segment',
+                visible: !this.privacyScreenEnabled,
+                value: this.screenCombinationMode,
+                segmentLabels: ['默认', '不修改', '确保开启', '主屏', '仅此屏'],
+                segmentValues: ['主机默认', '不修改', '确保开启', '设为主屏', '仅此屏幕'],
+                onSegmentChange: (value: string) => {
+                  this.screenCombinationMode = value;
+                  this.saveSetting(SettingsKeys.SCREEN_COMBINATION_MODE, value);
+                }
+              },
+              {
+                title: '断开后锁定屏幕',
+                subtitle: '断开连接后锁定主机屏幕',
+                type: 'toggle',
+                value: this.lockScreenAfterDisconnect,
+                action: () => {
+                  this.lockScreenAfterDisconnect = !this.lockScreenAfterDisconnect;
+                  this.saveSetting(SettingsKeys.LOCK_SCREEN_AFTER_DISCONNECT, this.lockScreenAfterDisconnect);
+                }
+              },
+              {
+                title: '剪贴板同步文本',
+                subtitle: 'Foundation Sunshine only - 与主机双向同步剪贴板文本',
+                type: 'toggle',
+                value: this.enableClipboardSyncText,
+                action: () => {
+                  this.enableClipboardSyncText = !this.enableClipboardSyncText;
+                  this.saveSetting(SettingsKeys.ENABLE_CLIPBOARD_SYNC_TEXT, this.enableClipboardSyncText);
+                }
+              },
+              {
+                title: '剪贴板同步图片',
+                subtitle: 'Sunshine only - 与主机双向同步 PNG 图片',
+                type: 'toggle',
+                value: this.enableClipboardSyncImage,
+                action: () => {
+                  this.enableClipboardSyncImage = !this.enableClipboardSyncImage;
+                  this.saveSetting(SettingsKeys.ENABLE_CLIPBOARD_SYNC_IMAGE, this.enableClipboardSyncImage);
+                }
+              },
+              {
+                title: '仅控制模式',
+                subtitle: '禁用音视频，仅传输输入',
+                type: 'toggle',
+                value: this.controlOnly,
+                action: () => {
+                  this.controlOnly = !this.controlOnly;
+                  this.saveSetting(SettingsKeys.CONTROL_ONLY, this.controlOnly);
+                }
+              },
+              {
+                title: 'STUN 公网地址探测',
+                subtitle: '通过 STUN 探测主机公网地址，用于网络诊断',
+                type: 'toggle',
+                value: this.enableStun,
+                action: () => {
+                  this.enableStun = !this.enableStun;
+                  this.saveSetting(SettingsKeys.ENABLE_STUN, this.enableStun);
+                }
+              }
+            ]
+          })
+
+          // 后处理
+          this.SettingsGroup({
+            id: 'post_process',
+            icon: $r('sys.symbol.wand_and_stars'),
+            title: '后处理',
+            items: [
+              {
+                title: 'OLED 暗部校正',
+                subtitle: '抖动补偿暗区灰阶断层，仅 HDR10(PQ) + MatePad Pro 12.2',
+                type: 'toggle',
+                value: this.enablePostProcess,
+                action: () => {
+                  this.enablePostProcess = !this.enablePostProcess;
+                  this.saveSetting(SettingsKeys.ENABLE_POST_PROCESS, this.enablePostProcess);
+                }
+              },
+              {
+                title: '超分辨率',
+                subtitle: ['关闭', 'XEngine 硬件超分', 'FSR 1 软件超分', '自动（推荐）'][this.upscaleMode] ?? '关闭',
+                type: 'select',
+                action: () => this.showUpscaleModePicker()
+              },
+              {
+                title: '超分锐度',
+                subtitle: this.upscaleSharpness <= 20 ? '柔和自然' : (this.upscaleSharpness <= 50 ? '适中锐化' : '强力锐化，可能出现液化伪影'),
+                type: 'slider',
+                visible: this.upscaleMode !== 0,
+                tooltip: '控制超分辨率后的锐化强度\n· 0-20%：柔和自然，推荐写实类游戏\n· 25-50%：适中锐化，适合大多数场景\n· 55%+：强力锐化，可能产生液化/过锐伪影',
+                value: this.upscaleSharpness,
+                min: 0,
+                max: 100,
+                step: 5,
+                unit: '%',
+                formatValue: (v: number) => `${v}%`,
+                onSliderChange: (value: number) => {
+                  this.upscaleSharpness = value;
+                  this.saveSetting(SettingsKeys.UPSCALE_SHARPNESS, value);
+                }
+              },
+              {
+                title: 'HDR 映像增强',
+                subtitle: ['关闭', '自研 Shader（SDR→HDR 逆向色调映射）', 'AIHDR（系统 AI 增强）'][this.sdrToHdrMode] ?? '关闭',
+                type: 'select',
+                action: () => this.showSdrToHdrModePicker()
+              },
+              {
+                title: 'SDR→HDR 亮度上限',
+                subtitle: '本机 SDR→HDR 映射的目标亮度，与报给主机的「HDR 峰值亮度」无关',
+                type: 'slider',
+                visible: this.sdrToHdrMode === 1,
+                value: this.sdrToHdrPeakNits,
+                min: 200,
+                max: 2000,
+                step: 50,
+                unit: ' nits',
+                formatValue: (v: number) => `${v} nits`,
+                onSliderChange: (value: number) => {
+                  this.sdrToHdrPeakNits = value;
+                  this.saveSetting(SettingsKeys.SDR_TO_HDR_PEAK_NITS, value);
+                }
+              },
+              {
+                title: '色彩鲜明度',
+                subtitle: 'HDR 增强画面的色彩饱和度',
+                type: 'slider',
+                visible: this.sdrToHdrMode === 1,
+                value: this.sdrToHdrSaturation,
+                min: 50,
+                max: 200,
+                step: 5,
+                unit: '%',
+                formatValue: (v: number) => `${v}%`,
+                onSliderChange: (value: number) => {
+                  this.sdrToHdrSaturation = value;
+                  this.saveSetting(SettingsKeys.SDR_TO_HDR_SATURATION, value);
+                }
+              },
+              {
+                title: '画面对比度',
+                subtitle: '降低可缓解高光过曝，提高可增强明暗层次',
+                type: 'slider',
+                visible: this.sdrToHdrMode === 1,
+                value: this.sdrToHdrContrast,
+                min: 50,
+                max: 200,
+                step: 5,
+                unit: '%',
+                formatValue: (v: number) => `${v}%`,
+                onSliderChange: (value: number) => {
+                  this.sdrToHdrContrast = value;
+                  this.saveSetting(SettingsKeys.SDR_TO_HDR_CONTRAST, value);
+                }
+              }
+            ]
+          })
+          
+          // 性能与调试
+          this.SettingsGroup({
+            id: 'performance',
+            icon: $r('sys.symbol.slider_horizontal_2'),
+            title: '性能与调试',
+            items: [
+              {
+                title: '解码队列深度',
+                subtitle: '0=自动（2）；数值越大越平滑，延迟也可能增加',
+                type: 'slider',
+                value: this.decoderBufferCount,
+                min: 0,
+                max: 8,
+                step: 1,
+                unit: this.decoderBufferCount === 0 ? '(自动)' : ' 个',
+                onSliderChange: (value: number) => {
+                  // 跳过 1，因为单缓冲不可用
+                  if (value === 1) {
+                    value = this.decoderBufferCount > 1 ? 0 : 2;
+                  }
+                  this.decoderBufferCount = value;
+                  this.saveSetting(SettingsKeys.DECODER_BUFFER_COUNT, value);
+                }
+              },
+              {
+                title: '同步解码 / 极低延迟 (实验性)',
+                subtitle: 'API 20+，主动轮询并只保留最新输出帧；延迟更低，平滑性可能略受影响',
+                type: 'toggle',
+                value: this.enableSyncDecode,
+                action: () => {
+                  this.enableSyncDecode = !this.enableSyncDecode;
+                  this.saveSetting(SettingsKeys.ENABLE_SYNC_DECODE, this.enableSyncDecode);
+                }
+              },
+              {
+                title: 'VRR 可变刷新率 (实验性)',
+                subtitle: '动态调整屏幕刷新率，可能丢帧以节能',
+                type: 'toggle',
+                value: this.enableVrr,
+                action: () => {
+                  this.enableVrr = !this.enableVrr;
+                  this.saveSetting(SettingsKeys.ENABLE_VRR, this.enableVrr);
+                }
+              },
+              {
+                title: 'VSync 渲染',
+                subtitle: '按时间戳精确呈现，减少撕裂；通常更平滑，但可能增加约 1 帧延迟',
+                type: 'toggle',
+                value: this.enableVsync,
+                action: () => {
+                  this.enableVsync = !this.enableVsync;
+                  this.saveSetting(SettingsKeys.ENABLE_VSYNC, this.enableVsync);
+                }
+              },
+              {
+                title: '相位调谐 (实验性)',
+                subtitle: '配合 Foundation Sunshine 主机的帧律感知；不是更快，只是每一帧都很会挑时机',
+                type: 'toggle',
+                value: this.enableHostPacedPresentation,
+                action: () => {
+                  this.enableHostPacedPresentation = !this.enableHostPacedPresentation;
+                  this.saveSetting(SettingsKeys.ENABLE_HOST_PACED_PRESENTATION,
+                    this.enableHostPacedPresentation);
+                }
+              },
+              {
+                title: '性能模式',
+                subtitle: '提高线程优先级，降低调度延迟，但会增加功耗和发热',
+                type: 'toggle',
+                value: this.performanceMode,
+                action: () => {
+                  this.performanceMode = !this.performanceMode;
+                  this.saveSetting(SettingsKeys.PERFORMANCE_MODE, this.performanceMode);
+                }
+              },
+              {
+                title: '性能覆盖层',
+                subtitle: '显示帧率和延迟信息',
+                type: 'toggle',
+                value: this.enablePerfOverlay,
+                action: () => {
+                  this.enablePerfOverlay = !this.enablePerfOverlay;
+                  this.saveSetting(SettingsKeys.ENABLE_PERF_OVERLAY, this.enablePerfOverlay);
+                }
+              },
+              {
+                title: '性能覆盖层方向',
+                type: 'segment',
+                value: this.perfOverlayOrientation,
+                visible: this.enablePerfOverlay,
+                segmentLabels: ['水平', '垂直'],
+                onSegmentChange: (value: string) => {
+                  this.perfOverlayOrientation = value;
+                  this.saveSetting(SettingsKeys.PERF_OVERLAY_ORIENTATION, value);
+                }
+              },
+              {
+                title: '性能覆盖层位置',
+                type: 'grid',
+                visible: this.enablePerfOverlay,
+                value: this.perfOverlayPosition,
+                gridLabels: ['左上角', '顶部', '右上角', '左侧', '居中', '右侧', '左下角', '底部', '右下角'],
+                gridValues: ['左上角', '顶部', '右上角', '左侧', '居中', '右侧', '左下角', '底部', '右下角'],
+                gridColumns: 3,
+                onGridSelect: (value: string) => {
+                  this.perfOverlayPosition = value;
+                  this.saveSetting(SettingsKeys.PERF_OVERLAY_POSITION, value);
+                }
+              },
+              {
+                title: '锁定覆盖层',
+                subtitle: '锁定后不可拖动，触摸穿透',
+                type: 'toggle',
+                visible: this.enablePerfOverlay,
+                value: this.perfOverlayLocked,
+                action: () => {
+                  this.perfOverlayLocked = !this.perfOverlayLocked;
+                  this.saveSetting(SettingsKeys.PERF_OVERLAY_LOCKED, this.perfOverlayLocked);
+                }
+              },
+              {
+                title: '覆盖层显示项目',
+                subtitle: `已选 ${this.perfOverlayItems.length} 项`,
+                type: 'select',
+                visible: this.enablePerfOverlay,
+                action: () => this.showPerfOverlayItemsPicker()
+              },
+              {
+                title: '串流后延迟提示',
+                subtitle: '串流结束后显示延迟统计',
+                type: 'toggle',
+                value: this.latencyToast,
+                action: () => {
+                  this.latencyToast = !this.latencyToast;
+                  this.saveSetting(SettingsKeys.LATENCY_TOAST, this.latencyToast);
+                }
+              },
+              {
+                title: '禁用警告',
+                subtitle: '隐藏性能警告提示',
+                type: 'toggle',
+                value: this.disableWarnings,
+                action: () => {
+                  this.disableWarnings = !this.disableWarnings;
+                  this.saveSetting(SettingsKeys.DISABLE_WARNINGS, this.disableWarnings);
+                }
+              },
+              {
+                title: '开发者模式',
+                subtitle: this.getDeveloperModeSubtitle(),
+                type: 'toggle',
+                value: this.developerMode,
+                action: () => {
+                  this.toggleDeveloperMode();
+                }
+              }
+            ]
+          })
+          
+          // UI 设置
+          this.SettingsGroup({
+            id: 'ui',
+            icon: $r('sys.symbol.display'),
+            title: '界面',
+            items: [
+              {
+                title: '小图标模式',
+                subtitle: '使用更小的应用图标',
+                type: 'toggle',
+                value: this.smallIconMode,
+                action: () => {
+                  UiSettings.setSmallIconMode(!this.smallIconMode);
+                }
+              },
+              {
+                title: '背景图片',
+                subtitle: this.getBackgroundImageTypeLabel(),
+                type: 'select',
+                action: () => this.showBackgroundImageTypePicker()
+              },
+              {
+                title: '自定义背景图 URL',
+                subtitle: this.backgroundImageUrl || '使用默认 API',
+                type: 'action',
+                action: () => this.showBackgroundImageUrlInput()
+              },
+              {
+                title: '恢复串流',
+                subtitle: '启动时恢复上次串流',
+                type: 'toggle',
+                value: this.resumeStream,
+                action: () => {
+                  this.resumeStream = !this.resumeStream;
+                  this.saveSetting(SettingsKeys.RESUME_STREAM, this.resumeStream);
+                }
+              },
+              {
+                title: '启用 ESC 菜单',
+                subtitle: '按 ESC 键显示菜单',
+                type: 'toggle',
+                value: this.enableEscMenu,
+                action: () => {
+                  this.enableEscMenu = !this.enableEscMenu;
+                  this.saveSetting(SettingsKeys.ENABLE_ESC_MENU, this.enableEscMenu);
+                }
+              },
+              {
+                title: 'ESC 菜单按键',
+                type: 'segment',
+                value: this.escMenuKey,
+                visible: this.enableEscMenu,
+                segmentLabels: ['ESC', 'F1', 'F12', '~'],
+                onSegmentChange: (value: string) => {
+                  this.escMenuKey = value;
+                  this.saveSetting(SettingsKeys.ESC_MENU_KEY, value);
+                }
+              },
+              {
+                title: '后台保活',
+                subtitle: '串流时保持后台运行，防止切后台后画面冻结',
+                type: 'toggle',
+                value: this.enableBackgroundTask,
+                action: () => {
+                  this.enableBackgroundTask = !this.enableBackgroundTask;
+                  this.saveSetting(SettingsKeys.ENABLE_BACKGROUND_TASK, this.enableBackgroundTask);
+                }
+              }
+            ]
+          })
+          
+          // 备份与恢复
+          this.SettingsGroup({
+            id: 'backup',
+            icon: $r('sys.symbol.share'),
+            title: '备份与恢复',
+            items: [
+              {
+                title: '自动备份',
+                subtitle: this.autoBackupEnabled ? '已开启，设置变更时自动保存' : '开启后每次修改设置自动备份到文件',
+                type: 'toggle',
+                value: this.autoBackupEnabled,
+                action: async () => {
+                  if (!this.autoBackupEnabled) {
+                    const ok = await SettingsBackupService.enableAutoBackup();
+                    this.autoBackupEnabled = ok;
+                  } else {
+                    await SettingsBackupService.disableAutoBackup();
+                    this.autoBackupEnabled = false;
+                  }
+                }
+              } as SettingItem,
+              {
+                title: '导出设置',
+                subtitle: '将所有设置、自定义按键、电脑列表导出为文件',
+                type: 'action',
+                action: () => {
+                  SettingsBackupService.exportToFile();
+                }
+              } as SettingItem,
+              {
+                title: '导入设置',
+                subtitle: '从备份文件恢复全部设置（需重启应用）',
+                type: 'action',
+                action: () => {
+                  SettingsBackupService.importFromFile();
+                }
+              } as SettingItem,
+              {
+                title: '还原默认设置',
+                subtitle: '清除所有自定义设置，恢复出厂默认值',
+                type: 'action',
+                action: () => {
+                  this.confirmResetSettings();
+                }
+              } as SettingItem
+            ]
+          })
+          
+          } // ── 高级设置区结束 ──
+
+          // 关于
+          this.SettingsGroup({
+            id: 'about',
+            icon: $r('sys.symbol.info_circle_fill'),
+            title: '关于',
+            items: [
+              {
+                title: '版本',
+                subtitle: this.appVersion,
+                type: 'action',
+                action: () => {
+                  const pasteData = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, this.appVersion);
+                  pasteboard.getSystemPasteboard().setDataSync(pasteData);
+                  this.showToast(`已复制版本号: ${this.appVersion}`);
+                }
+              },
+              {
+                title: '上次串流诊断',
+                subtitle: '复制最近一次串流的帧率与 PTS 调度数据',
+                type: 'action',
+                action: async () => {
+                  await this.copyLastStreamDiagnostics();
+                }
+              },
+              {
+                title: '更新日志',
+                subtitle: '查看版本更新历史',
+                type: 'action',
+                action: () => {
+                  this.showChangelog();
+                }
+              },
+              {
+                title: '开源项目 · 致谢',
+                subtitle: '本项目参考与使用的开源项目及许可',
+                type: 'action',
+                action: () => {
+                  this.showOpenSourceLicenses();
+                }
+              },
+              {
+                title: '隐私政策',
+                subtitle: '查看数据收集和使用说明',
+                type: 'action',
+                action: () => {
+                  this.showPrivacyPolicy();
+                }
+              }
+            ]
+          })
+
+          
+          // 底部间距
+          Column()
+            .height(AppSpacing.XXLarge)
+              }
+              .width('100%')
+              .padding({ left: AppSpacing.Large, right: AppSpacing.Large })
+            }
+          }
+        }
+        .layoutWeight(1)
+        .scrollBar(BarState.Off)
+        .edgeEffect(EdgeEffect.Spring)
+        .align(Alignment.Top)
+      }
+      .layoutWeight(1)
+      .alignItems(VerticalAlign.Top)
+    }
+    .width('100%')
+    .height('100%')
+    .backgroundColor(AppColors.Background)
+    .onAreaChange((_oldValue: Area, newValue: Area) => {
+      const width = newValue.width as number;
+      this.isWideScreen = width > 840;
+    })
+    .bindSheet($$this.showTextInputDialog, this.BottomSheetContent(), {
+      height: SheetSize.FIT_CONTENT,
+      backgroundColor: Color.Transparent,
+      dragBar: false,
+      showClose: false,
+      preferType: SheetType.BOTTOM,
+      onDisappear: () => {
+        if (this.textInputDismissCallback) {
+          this.textInputDismissCallback();
+          this.textInputDismissCallback = null;
+        }
+      }
+    } as SheetOptions)
+    }
+    .hideTitleBar(true)
+    .onShown(() => this.onPageShow())
+  }
+
+  @Builder
+  TitleBar() {
+    Row() {
+      Button({ type: ButtonType.Circle }) {
+        Image($r('app.media.ic_back'))
+          .width(AppSizes.IconMedium)
+          .height(AppSizes.IconMedium)
+          .fillColor(AppColors.Primary)
+      }
+      .width(40)
+      .height(40)
+      .backgroundColor(AppColors.Surface)
+      .borderWidth(1)
+      .borderColor(AppColors.CardBorder)
+      .onClick(() => AppNav.pop())
+
+      Column() {
+        Text('设置')
+          .fontSize(AppSizes.FontTitle)
+          .fontWeight(FontWeight.Bold)
+          .fontColor(AppColors.Primary)
+        Text('自定义串流体验')
+          .fontSize(AppSizes.FontCaption)
+          .fontColor(AppColors.TextSecondary)
+          .margin({ top: 2 })
+      }
+      .alignItems(HorizontalAlign.Start)
+      .margin({ left: AppSpacing.Medium })
+
+      Blank()
+    }
+    .width('100%')
+    .padding({
+      left: AppSpacing.Large,
+      right: AppSpacing.Large,
+      top: this.topSafeHeight,
+      bottom: AppSpacing.Large
+    })
+  }
+
+  @Builder
+  SidebarGroupRow(meta: SidebarGroupMeta) {
+    Row() {
+      // 分组图标
+      Column() {
+        SymbolGlyph(meta.icon)
+          .fontSize(16)
+          .fontColor([this.expandedGroup === meta.id ? AppColors.Primary : AppColors.TextSecondary])
+          .renderingStrategy(SymbolRenderingStrategy.SINGLE)
+      }
+      .width(24)
+      .height(24)
+      .justifyContent(FlexAlign.Center)
+      .alignItems(HorizontalAlign.Center)
+
+      Text(meta.title)
+        .fontSize(AppSizes.FontCaption)
+        .fontWeight(this.expandedGroup === meta.id ? FontWeight.Bold : FontWeight.Normal)
+        .fontColor(this.expandedGroup === meta.id ? AppColors.Primary : AppColors.TextPrimary)
+        .margin({ left: AppSpacing.Small })
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+    }
+    .width('100%')
+    .height(44)
+    .padding({ left: AppSpacing.Medium, right: AppSpacing.Medium })
+    .borderRadius(AppSizes.RadiusMedium)
+    .backgroundColor(this.expandedGroup === meta.id ? AppColors.Surface : Color.Transparent)
+    .borderWidth(this.expandedGroup === meta.id ? 1 : 0)
+    .borderColor(this.expandedGroup === meta.id ? AppColors.CardBorder : Color.Transparent)
+    .onClick(() => {
+      this.expandedGroup = meta.id;
+    })
+  }
+
+  @Builder
+  SettingsSidebar() {
+    Scroll() {
+      Column({ space: 4 }) {
+        // 普通分组（始终可见）
+        ForEach(this.sidebarNormalGroups, (meta: SidebarGroupMeta) => {
+          this.SidebarGroupRow(meta)
+        }, (meta: SidebarGroupMeta) => meta.id)
+
+        // 高级设置折叠头
+        Row() {
+          Column() {
+            SymbolGlyph($r('sys.symbol.gearshape'))
+              .fontSize(16)
+              .fontColor([AppColors.TextSecondary])
+              .renderingStrategy(SymbolRenderingStrategy.SINGLE)
+          }
+          .width(24)
+          .height(24)
+          .justifyContent(FlexAlign.Center)
+          .alignItems(HorizontalAlign.Center)
+
+          Text('高级设置')
+            .fontSize(AppSizes.FontCaption)
+            .fontColor(AppColors.TextSecondary)
+            .margin({ left: AppSpacing.Small })
+
+          Blank()
+
+          Image($r('app.media.ic_arrow_right'))
+            .width(14)
+            .height(14)
+            .fillColor(AppColors.TextSecondary)
+            .rotate({ angle: this.advancedExpanded ? 90 : 0 })
+            .animation({ duration: AppAnimation.Fast, curve: Curve.EaseInOut })
+        }
+        .width('100%')
+        .height(44)
+        .padding({ left: AppSpacing.Medium, right: AppSpacing.Medium })
+        .borderRadius(AppSizes.RadiusMedium)
+        .onClick(() => {
+          this.advancedExpanded = !this.advancedExpanded;
+        })
+
+        // 高级分组（展开后才显示）
+        if (this.advancedExpanded) {
+          Column({ space: 4 }) {
+            ForEach(this.sidebarAdvancedGroups, (meta: SidebarGroupMeta) => {
+              this.SidebarGroupRow(meta)
+            }, (meta: SidebarGroupMeta) => meta.id)
+          }
+          .width('100%')
+          .transition(TransitionEffect.OPACITY.animation({ duration: AppAnimation.Fast }))
+        }
+
+        // 尾部普通分组
+        ForEach(this.sidebarFooterGroups, (meta: SidebarGroupMeta) => {
+          this.SidebarGroupRow(meta)
+        }, (meta: SidebarGroupMeta) => meta.id)
+      }
+      .width('100%')
+      .padding({ left: AppSpacing.Medium, right: AppSpacing.Small, top: AppSpacing.Medium })
+    }
+    .width(180)
+    .height('100%')
+    .scrollBar(BarState.Off)
+    .edgeEffect(EdgeEffect.Spring)
+    .align(Alignment.Top)
+  }
+
+  @Builder
+  AdvancedSectionHeader() {
+    Column() {
+      Row() {
+        // 分组图标
+        Column() {
+          SymbolGlyph($r('sys.symbol.gearshape'))
+            .fontSize(18)
+            .fontColor([AppColors.Primary])
+            .renderingStrategy(SymbolRenderingStrategy.SINGLE)
+        }
+        .width(28)
+        .height(28)
+        .borderRadius(8)
+        .backgroundColor(AppColors.Surface)
+        .borderWidth(1)
+        .borderColor(AppColors.CardBorder)
+        .justifyContent(FlexAlign.Center)
+        .alignItems(HorizontalAlign.Center)
+        .margin({ right: AppSpacing.Small })
+
+        Column() {
+          Text('高级设置')
+            .fontSize(AppSizes.FontCaption)
+            .fontWeight(FontWeight.Bold)
+            .fontColor(AppColors.Primary)
+          Text('专业参数，普通使用无需修改')
+            .fontSize(10)
+            .fontColor(AppColors.TextTertiary)
+            .margin({ top: 1 })
+        }
+        .alignItems(HorizontalAlign.Start)
+
+        Blank()
+
+        // 展开/折叠箭头
+        Image($r('app.media.ic_arrow_right'))
+          .width(16)
+          .height(16)
+          .fillColor(AppColors.Primary)
+          .rotate({ angle: this.advancedExpanded ? 90 : 0 })
+          .animation({ duration: AppAnimation.Fast, curve: Curve.EaseInOut })
+      }
+      .width('100%')
+      .height(48)
+      .alignItems(VerticalAlign.Center)
+      .padding({ left: AppSpacing.Small, right: AppSpacing.Medium })
+      .backgroundColor(this.advancedExpanded ? AppColors.Surface : Color.Transparent)
+      .borderRadius(AppSizes.RadiusMedium)
+      .onClick(() => {
+        this.advancedExpanded = !this.advancedExpanded;
+      })
+
+      // 展开提示
+      if (this.advancedExpanded) {
+        Text('以下为高级参数，修改后立即生效')
+          .fontSize(10)
+          .fontColor(AppColors.TextTertiary)
+          .width('100%')
+          .padding({ left: AppSpacing.Small, top: 2 })
+      }
+    }
+    .width('100%')
+    .margin({ bottom: AppSpacing.Medium })
+  }
+
+  @Builder
+  SettingsGroup(group: SettingGroup) {
+    // 宽屏模式：仅渲染当前选中的分组（侧边栏负责导航），不显示分组标题
+    if (this.isWideScreen) {
+      if (this.expandedGroup === group.id) {
+        Column() {
+          // 设置项列表 - 直接展示
+          Column() {
+            ForEach(group.items.filter((item: SettingItem) => item.visible !== false), (item: SettingItem, index: number) => {
+              this.SettingItemView(item)
+
+              if (index < group.items.filter((i: SettingItem) => i.visible !== false).length - 1) {
+                Divider()
+                  .color(AppColors.CardBorder)
+                  .margin({ left: AppSpacing.Medium, right: AppSpacing.Medium })
+              }
+            }, (item: SettingItem) => `${item.title}_${item.value}_${item.subtitle}_${item.disabled}_${item.visible}`)
+          }
+          .width('100%')
+          .backgroundColor(AppColors.CardBackground)
+          .borderRadius(AppSizes.RadiusLarge)
+          .borderWidth(1)
+          .borderColor(AppColors.CardBorder)
+        }
+        .width('100%')
+      }
+    } else {
+      // 窄屏模式：分组标题 + 可折叠内容
+      Column() {
+        // 分组标题 - 带图标的霍虹风格（可点击展开/折叠）
+        Row() {
+          // 分组图标
+          Column() {
+            SymbolGlyph(group.icon)
+              .fontSize(18)
+              .fontColor([AppColors.Primary])
+              .renderingStrategy(SymbolRenderingStrategy.SINGLE)
+          }
+          .width(28)
+          .height(28)
+          .borderRadius(8)
+          .backgroundColor(AppColors.Surface)
+          .borderWidth(1)
+          .borderColor(AppColors.CardBorder)
+          .justifyContent(FlexAlign.Center)
+          .alignItems(HorizontalAlign.Center)
+          .margin({ right: AppSpacing.Small })
+
+          Text(group.title.toUpperCase())
+            .fontSize(AppSizes.FontCaption)
+            .fontWeight(FontWeight.Bold)
+            .fontColor(AppColors.Primary)
+          
+          Blank()
+          
+          // 展开/折叠箭头
+          Image($r('app.media.ic_arrow_right'))
+            .width(16)
+            .height(16)
+            .fillColor(AppColors.Primary)
+            .rotate({ angle: this.expandedGroup === group.id ? 90 : 0 })
+            .animation({ duration: AppAnimation.Fast, curve: Curve.EaseInOut })
+        }
+        .width('100%')
+        .height(40)
+        .alignItems(VerticalAlign.Center)
+        .padding({ left: AppSpacing.Small, right: AppSpacing.Medium })
+        .backgroundColor(this.expandedGroup === group.id ? AppColors.Surface : Color.Transparent)
+        .borderRadius(AppSizes.RadiusMedium)
+        .focusable(true)
+        .focusOnTouch(true)
+        .focusBox({
+          margin: LengthMetrics.vp(1),
+          strokeColor: ColorMetrics.rgba(0, 212, 255, 0.8),
+          strokeWidth: LengthMetrics.vp(1.5)
+        })
+        .onKeyEvent((event: KeyEvent) => {
+          if (event.type === KeyType.Down && (event.keyCode === 2054 || event.keyCode === 2050)) {
+            if (this.expandedGroup === group.id) {
+              this.expandedGroup = '';
+            } else {
+              this.expandedGroup = group.id;
+            }
+            return true;
+          }
+          return false;
+        })
+        .onClick(() => {
+          if (this.expandedGroup === group.id) {
+            this.expandedGroup = '';
+          } else {
+            this.expandedGroup = group.id;
+          }
+        })
+
+        // 设置项容器 - 深色卡片（可折叠）
+        if (this.expandedGroup === group.id) {
+          Column() {
+            ForEach(group.items.filter((item: SettingItem) => item.visible !== false), (item: SettingItem, index: number) => {
+              this.SettingItemView(item)
+
+              if (index < group.items.filter((i: SettingItem) => i.visible !== false).length - 1) {
+                Divider()
+                  .color(AppColors.CardBorder)
+                  .margin({ left: AppSpacing.Medium, right: AppSpacing.Medium })
+              }
+            }, (item: SettingItem) => `${item.title}_${item.value}_${item.subtitle}_${item.disabled}_${item.visible}`)
+          }
+          .width('100%')
+          .backgroundColor(AppColors.CardBackground)
+          .borderRadius(AppSizes.RadiusLarge)
+          .borderWidth(1)
+          .borderColor(AppColors.CardBorder)
+          .margin({ top: AppSpacing.Small })
+          .transition(TransitionEffect.OPACITY.animation({ duration: AppAnimation.Fast }))
+        }
+      }
+      .width('100%')
+      .margin({ bottom: AppSpacing.Medium })
+    }
+  }
+
+  @Builder
+  SettingItemView(item: SettingItem) {
+    if (item.type === 'segment') {
+      // 分段按钮布局 - 参考系统设置风格：标题 + 居中分段按钮 + 辅助说明
+      Column() {
+        // 标题行
+        Row() {
+          Text(item.title)
+            .fontSize(AppSizes.FontBody)
+            .fontColor(item.disabled ? AppColors.TextSecondary : AppColors.TextPrimary)
+
+          if (item.tooltip) {
+            SymbolGlyph($r('sys.symbol.info_circle'))
+              .fontSize(14)
+              .fontColor([item.disabled ? AppColors.TextSecondary : AppColors.TextTertiary])
+              .renderingStrategy(SymbolRenderingStrategy.SINGLE)
+              .margin({ left: 6 })
+              .onClick(() => {
+                const popupId = item.key ?? item.title
+                this.activePopupKey = this.activePopupKey === popupId ? '' : popupId
+              })
+              .bindPopup(this.activePopupKey === (item.key ?? item.title), {
+                message: item.tooltip as string,
+                placement: Placement.Top,
+                enableArrow: true,
+                onStateChange: (e) => {
+                  if (!e.isVisible) {
+                    this.activePopupKey = ''
+                  }
+                }
+              })
+          }
+
+          // Pro 标记
+          if (item.isPro) {
+            Text('Pro')
+              .fontSize(10)
+              .fontColor(AppColors.TextOnPrimary)
+              .backgroundColor(AppColors.PrimaryDark)
+              .borderRadius(4)
+              .padding({ left: 4, right: 4, top: 1, bottom: 1 })
+              .margin({ left: 6 })
+          }
+        }
+        .alignItems(VerticalAlign.Center)
+        .width('100%')
+
+        // 分段选择器 - 居中显示，宽屏下受 maxWidth 448vp 约束
+        Column() {
+          InlineSegmentPicker({
+            labels: item.segmentLabels ?? [],
+            selectedValue: item.value as string ?? '',
+            values: item.segmentValues ?? [],
+            disabled: item.disabled ?? false,
+            onValueChange: (value: string) => {
+              if (item.onSegmentChange) {
+                item.onSegmentChange(value);
+              }
+            }
+          })
+        }
+          .margin({ top: AppSpacing.Medium })
+
+        // 辅助说明文字（置于分段按钮下方，作为脚注）
+        if (item.subtitle) {
+          Text(item.subtitle)
+            .fontSize(AppSizes.FontCaption)
+            .fontColor(AppColors.TextTertiary)
+            .margin({ top: AppSpacing.XSmall })
+            .width('100%')
+        }
+      }
+      .width('100%')
+      .alignItems(HorizontalAlign.Center)
+      .padding({ left: AppSpacing.Medium, right: AppSpacing.Medium, top: AppSpacing.Medium, bottom: AppSpacing.Medium })
+    } else if (item.type === 'grid') {
+      // 九宫格位置选择器 — 独占一行，模拟屏幕 + 位置圆点
+      Column({ space: AppSpacing.Small }) {
+        // 标题行
+        Row() {
+          Text(item.title)
+            .fontSize(AppSizes.FontBody)
+            .fontColor(item.disabled ? AppColors.TextSecondary : AppColors.TextPrimary)
+          Blank()
+          // 显示当前选中值
+          Text(item.value as string)
+            .fontSize(AppSizes.FontCaption)
+            .fontColor(AppColors.Primary)
+        }
+        .width('100%')
+
+        // 模拟屏幕 — 深色矩形内 3×3 圆点
+        Grid() {
+          ForEach(item.gridLabels ?? [], (label: string, idx: number) => {
+            GridItem() {
+              Column()
+                .width((item.value as string) === (item.gridValues ? item.gridValues[idx] : label) ? 14 : 8)
+                .height((item.value as string) === (item.gridValues ? item.gridValues[idx] : label) ? 14 : 8)
+                .borderRadius(7)
+                .backgroundColor(
+                  (item.value as string) === (item.gridValues ? item.gridValues[idx] : label)
+                    ? AppColors.Primary : 'transparent'
+                )
+                .borderWidth(1.5)
+                .borderColor(
+                  (item.value as string) === (item.gridValues ? item.gridValues[idx] : label)
+                    ? AppColors.Primary : AppColors.TextTertiary
+                )
+                .shadow(
+                  (item.value as string) === (item.gridValues ? item.gridValues[idx] : label)
+                    ? { radius: 6, color: AppColors.PrimaryGlow, offsetX: 0, offsetY: 0 }
+                    : { radius: 0, color: 'transparent', offsetX: 0, offsetY: 0 }
+                )
+            }
+            .onClick(() => {
+              if (!item.disabled && item.onGridSelect) {
+                item.onGridSelect(item.gridValues ? item.gridValues[idx] : label);
+              }
+            })
+          }, (label: string, idx: number) => `grid_${label}_${idx}_${item.value}`)
+        }
+        .columnsTemplate('1fr 1fr 1fr')
+        .rowsTemplate('1fr '.repeat(Math.ceil((item.gridLabels?.length ?? 9) / (item.gridColumns ?? 3))).trim())
+        .width('100%')
+        .constraintSize({ maxWidth: 280 })
+        .height(100)
+        .backgroundColor(AppColors.SurfaceDark)
+        .borderRadius(12)
+        .borderWidth(1)
+        .borderColor(AppColors.CardBorder)
+        .padding(12)
+
+        // 辅助说明
+        if (item.subtitle) {
+          Text(item.subtitle)
+            .fontSize(AppSizes.FontCaption)
+            .fontColor(AppColors.TextTertiary)
+            .width('100%')
+        }
+      }
+      .width('100%')
+      .alignItems(HorizontalAlign.Center)
+      .padding({ left: AppSpacing.Medium, right: AppSpacing.Medium, top: AppSpacing.Medium, bottom: AppSpacing.Medium })
+    } else {
+      // 原有布局：标题左侧 + 控件右侧
+      Row() {
+        // 文字内容
+        Column() {
+          Row() {
+            Text(item.title)
+              .fontSize(AppSizes.FontBody)
+              .fontColor(item.disabled ? AppColors.TextSecondary : AppColors.TextPrimary)
+
+            if (item.tooltip) {
+              SymbolGlyph($r('sys.symbol.info_circle'))
+                .fontSize(14)
+                .fontColor([item.disabled ? AppColors.TextSecondary : AppColors.TextTertiary])
+                .renderingStrategy(SymbolRenderingStrategy.SINGLE)
+                .margin({ left: 6 })
+                .onClick(() => {
+                  const popupId = item.key ?? item.title
+                  this.activePopupKey = this.activePopupKey === popupId ? '' : popupId
+                })
+                .bindPopup(this.activePopupKey === (item.key ?? item.title), {
+                  message: item.tooltip as string,
+                  placement: Placement.Top,
+                  enableArrow: true,
+                  onStateChange: (e) => {
+                    if (!e.isVisible) {
+                      this.activePopupKey = ''
+                    }
+                  }
+                })
+            }
+            
+            // Pro 标记
+            if (item.isPro) {
+              Text('Pro')
+                .fontSize(10)
+                .fontColor(AppColors.TextOnPrimary)
+                .backgroundColor(AppColors.PrimaryDark)
+                .borderRadius(4)
+                .padding({ left: 4, right: 4, top: 1, bottom: 1 })
+                .margin({ left: 6 })
+            }
+          }
+          .alignItems(VerticalAlign.Center)
+
+          if (item.subtitle) {
+            Text(item.subtitle)
+              .fontSize(AppSizes.FontCaption)
+              .fontColor(AppColors.TextSecondary)
+              .margin({ top: 2 })
+          }
+        }
+        .alignItems(HorizontalAlign.Start)
+        .layoutWeight(1)
+
+        // 右侧控件
+        if (item.type === 'toggle') {
+          Toggle({ type: ToggleType.Switch, isOn: item.value as boolean })
+            .selectedColor(AppColors.Primary)
+            .enabled(!item.disabled)
+            .onChange(() => {
+              if (item.action && !item.disabled) {
+                item.action();
+              }
+            })
+        } else if (item.type === 'slider') {
+          // 使用公共滑块组件
+          Column() {
+            SettingSlider({
+              config: {
+                value: item.value as number,
+                min: item.min ?? 0,
+                max: item.max ?? 100,
+                step: item.step,
+                unit: item.unit,
+                isLogarithmic: item.isLogarithmic,
+                snapValues: item.snapValues,
+                snapThreshold: item.snapThreshold,
+                formatValue: item.formatValue,
+                onChange: (value: number) => {
+                  if (item.onSliderChange) {
+                    item.onSliderChange(value);
+                  }
+                }
+              }
+            })
+          }
+            .width(210)
+            .opacity(item.disabled ? 0.5 : 1.0)
+        } else if (item.type === 'select' || item.type === 'action') {
+          Image($r('app.media.ic_arrow_right'))
+            .width(16)
+            .height(16)
+            .fillColor(item.disabled ? AppColors.TextSecondary : AppColors.Primary)
+        }
+      }
+      .width('100%')
+      .height(item.type === 'slider' ? 70 : 60)
+      .padding({ left: AppSpacing.Medium, right: AppSpacing.Medium })
+      .focusable(!item.disabled)
+      .focusOnTouch(true)
+      .focusBox({
+        margin: LengthMetrics.vp(1),
+        strokeColor: ColorMetrics.rgba(74, 222, 128, 0.8),
+        strokeWidth: LengthMetrics.vp(1.5)
+      })
+      .onKeyEvent((event: KeyEvent) => {
+        if (event.type === KeyType.Down && !item.disabled) {
+          // A键/回车 → 触发操作
+          if (event.keyCode === 2054 || event.keyCode === 2050) {
+            if (item.type === 'toggle' && item.action) {
+              item.action();
+            } else if (item.action) {
+              item.action();
+            }
+            return true;
+          }
+        }
+        return false;
+      })
+      .onClick(() => {
+        if (item.disabled) return;
+        Logger.info('SettingsPageV2', `SettingsPageV2: 点击设置项 ${item.title}, type=${item.type}, hasAction=${!!item.action}`);
+        if (item.type !== 'toggle' && item.action) {
+          Logger.info('SettingsPageV2', `SettingsPageV2: 执行 action`);
+          item.action();
+        }
+      })
+    }
+  }
+
+  private showUpscaleModePicker(): void {
+    const options: PickerOption[] = [
+      { title: '关闭', subtitle: '不使用超分辨率', value: 0 } as PickerOption,
+      { title: 'XEngine 硬件超分', subtitle: '华为 GPU 加速空间超分（推荐）', value: 1 } as PickerOption,
+      { title: 'FSR 1 软件超分', subtitle: 'AMD FidelityFX 边缘自适应上采样', value: 2 } as PickerOption,
+      { title: '自动', subtitle: '优先 XEngine，不支持时回退 FSR 1', value: 3 } as PickerOption,
+    ];
+
+    const config: PickerConfig = {
+      title: '超分辨率模式',
+      subtitle: '低分辨率串流 + GPU 超分 = 低带宽高画质',
+      selectedValue: this.upscaleMode,
+      options: options,
+      onSelect: (option: PickerOption) => {
+        const value = option.value as number;
+        this.upscaleMode = value;
+        this.saveSetting(SettingsKeys.UPSCALE_MODE, value);
+      }
+    };
+    this.showPicker(config);
+  }
+
+  private showSdrToHdrModePicker(): void {
+    const options: PickerOption[] = [
+      { title: '关闭', subtitle: '不进行 HDR 增强', value: 0 } as PickerOption,
+      { title: '自研 Shader', subtitle: 'SDR→HDR 逆向色调映射，可调亮度/饱和度/对比度', value: 1 } as PickerOption,
+    ];
+    if (this.aihdrSupported) {
+      options.push({ title: 'AIHDR', subtitle: '系统 AI HDR 增强，画质更自然', value: 2 } as PickerOption);
+    }
+
+    const config: PickerConfig = {
+      title: 'HDR 映像增强',
+      subtitle: this.aihdrSupported ? '将 SDR 画面增强为 HDR 显示效果' : '将 SDR 画面增强为 HDR 显示效果（当前设备不支持 AIHDR）',
+      selectedValue: this.sdrToHdrMode,
+      options: options,
+      onSelect: (option: PickerOption) => {
+        const value = option.value as number;
+        this.sdrToHdrMode = value;
+        this.sdrToHdr = (value === 1);
+        this.saveSetting(SettingsKeys.SDR_TO_HDR_MODE, value);
+        this.saveSetting(SettingsKeys.SDR_TO_HDR, this.sdrToHdr);
+      }
+    };
+    this.showPicker(config);
+  }
+
+  private showResolutionPicker(): void {
+    // 预设分辨率（对齐Android）
+    const presetOptions: PickerOption[] = [
+      { title: '720p', subtitle: '1280×720', value: '720p' } as PickerOption,
+      { title: '1080p', subtitle: '1920×1080', value: '1080p' } as PickerOption,
+      { title: '1440p', subtitle: '2560×1440', value: '1440p' } as PickerOption,
+      { title: '4K', subtitle: '3840×2160', value: '4K' } as PickerOption
+    ];
+    
+    // 添加本地分辨率选项（如果有效且不与预设重复）
+    const nativeOptions: PickerOption[] = [];
+    if (this.nativeWidth > 0 && this.nativeHeight > 0) {
+      // 检查是否与预设分辨率重复
+      const isPreset = presetOptions.some(opt => {
+        const val = opt.value as string;
+        switch (val) {
+          case '720p': return this.nativeWidth === 1280 && this.nativeHeight === 720;
+          case '1080p': return this.nativeWidth === 1920 && this.nativeHeight === 1080;
+          case '1440p': return this.nativeWidth === 2560 && this.nativeHeight === 1440;
+          case '4K': return this.nativeWidth === 3840 && this.nativeHeight === 2160;
+          default: return false;
+        }
+      });
+      
+      if (!isPreset) {
+        nativeOptions.push({
+          title: '本机分辨率',
+          subtitle: `${this.nativeWidth}×${this.nativeHeight}`,
+          value: 'native'
+        } as PickerOption);
+      }
+    }
+    
+    // 添加自定义分辨率
+    const customOptions: PickerOption[] = this.customResolutions
+      .filter(res => {
+        // 排除与本地分辨率重复的自定义分辨率
+        const nativeValue = `${this.nativeWidth}x${this.nativeHeight}`;
+        return res !== nativeValue;
+      })
+      .map(res => {
+        const parts = res.split('x');
+        return { 
+          title: res, 
+          subtitle: `自定义: ${parts[0]}×${parts[1]}`, 
+          value: res 
+        } as PickerOption;
+      });
+    
+    // 添加"自定义..."选项
+    const customActionOption: PickerOption = {
+      title: '自定义...',
+      subtitle: '输入任意分辨率',
+      value: 'custom_input'
+    } as PickerOption;
+    
+    // 添加"管理自定义"选项（仅已有自定义分辨率时显示）
+    const manageOptions: PickerOption[] = [];
+    if (this.customResolutions.length > 0) {
+      manageOptions.push(
+        { title: '管理自定义分辨率', subtitle: `已添加 ${this.customResolutions.length} 个，点击管理`, value: 'manage_custom' } as PickerOption
+      );
+    }
+    
+    const allOptions = [...presetOptions, ...nativeOptions, ...customOptions, customActionOption, ...manageOptions];
+    
+    const config: PickerConfig = {
+      title: '选择分辨率',
+      subtitle: '选择适合您显示器的分辨率',
+      selectedValue: this.resolution,
+      options: allOptions,
+      onSelect: (option: PickerOption) => {
+        const value = option.value as string;
+        if (value === 'custom_input') {
+          // 延迟打开输入框，等待 picker dialog 关闭动画完成
+          setTimeout(() => this.showAddResolutionInput(), 200);
+        } else if (value === 'manage_custom') {
+          setTimeout(() => this.showCustomResolutionDialog(), 200);
+        } else {
+          this.resolution = value;
+          this.saveSetting(SettingsKeys.RESOLUTION, value);
+        }
+      }
+    };
+    this.showPicker(config);
+  }
+
+  /**
+   * 显示自定义分辨率管理对话框 — 支持逐个删除和添加
+   */
+  private showCustomResolutionDialog(): void {
+    // 将已有的自定义分辨率显示为可删除的选项
+    const existingOptions: PickerOption[] = this.customResolutions.map(res => {
+      const parts = res.split('x');
+      const w = parseInt(parts[0]) || 0;
+      const h = parseInt(parts[1]) || 0;
+      const ratio = this.calcAspectRatio(w, h);
+      return {
+        title: `${parts[0]}×${parts[1]}`,
+        subtitle: ratio ? `${ratio} — 点击删除` : '点击删除',
+        value: `delete:${res}`
+      } as PickerOption;
+    });
+
+    // 添加操作选项
+    const actionOptions: PickerOption[] = [
+      { title: '+ 添加新分辨率', subtitle: '输入宽度和高度', value: 'action:add' } as PickerOption,
+    ];
+    if (this.customResolutions.length > 0) {
+      actionOptions.push(
+        { title: '清空全部', subtitle: `删除所有 ${this.customResolutions.length} 个自定义分辨率`, value: 'action:clear' } as PickerOption
+      );
+    }
+
+    const allOptions = [...existingOptions, ...actionOptions];
+    
+    const config: PickerConfig = {
+      title: '自定义分辨率管理',
+      subtitle: this.customResolutions.length > 0 ? `已添加 ${this.customResolutions.length} 个` : '暂无自定义分辨率',
+      selectedValue: '',
+      options: allOptions,
+      onSelect: (option: PickerOption) => {
+        const value = option.value as string;
+        if (value === 'action:add') {
+          // 延迟打开输入框，等待 picker dialog 关闭动画完成
+          setTimeout(() => this.showAddResolutionInput(), 200);
+        } else if (value === 'action:clear') {
+          this.clearAllCustomResolutions();
+        } else if (value.startsWith('delete:')) {
+          const res = value.substring(7);
+          this.removeCustomResolution(res);
+        }
+      }
+    };
+    this.showPicker(config);
+  }
+
+  /**
+   * 显示添加分辨率输入框 - 使用文本输入弹窗
+   */
+  private showAddResolutionInput(): void {
+    this.customResWidth = '';
+    this.customResHeight = '';
+    this.customResAspectRatio = '';
+    this.bottomSheetType = 'resolution';
+    this.showTextInputDialog = true;
+  }
+
+  /**
+   * 显示预定义的常用自定义分辨率供选择（备用）
+   */
+  private showPredefinedCustomResolutions(): void {
+    const predefinedResolutions: PickerOption[] = [
+      { title: '21:9 超宽 2K', subtitle: '2560×1080', value: '2560x1080' } as PickerOption,
+      { title: '21:9 超宽 QHD', subtitle: '3440×1440', value: '3440x1440' } as PickerOption,
+      { title: '21:9 超宽 4K', subtitle: '5120×2160', value: '5120x2160' } as PickerOption,
+      { title: '32:9 超超宽 1080p', subtitle: '3840×1080', value: '3840x1080' } as PickerOption,
+      { title: '32:9 超超宽 1440p', subtitle: '5120×1440', value: '5120x1440' } as PickerOption,
+      { title: '16:10 WUXGA', subtitle: '1920×1200', value: '1920x1200' } as PickerOption,
+      { title: '16:10 WQXGA', subtitle: '2560×1600', value: '2560x1600' } as PickerOption,
+      { title: '4:3 XGA', subtitle: '1024×768', value: '1024x768' } as PickerOption,
+      { title: '4:3 SXGA', subtitle: '1280×1024', value: '1280x1024' } as PickerOption,
+      { title: '5K', subtitle: '5120×2880', value: '5120x2880' } as PickerOption,
+      { title: '8K UHD', subtitle: '7680×4320', value: '7680x4320' } as PickerOption,
+    ].filter(opt => !this.customResolutions.includes(opt.value as string));
+
+    if (predefinedResolutions.length === 0) {
+      this.showToast('所有预设分辨率都已添加');
+      return;
+    }
+
+    const config: PickerConfig = {
+      title: '选择自定义分辨率',
+      subtitle: '选择要添加的非标准分辨率',
+      selectedValue: '',
+      options: predefinedResolutions,
+      onSelect: (option: PickerOption) => {
+        this.addCustomResolution(option.value as string);
+      }
+    };
+    this.showPicker(config);
+  }
+
+  /**
+   * 添加自定义分辨率
+   */
+  private addCustomResolution(resolution: string): void {
+    // 验证格式
+    const match = resolution.match(/^(\d+)x(\d+)$/);
+    if (!match) {
+      this.showToast('分辨率格式无效，应为: 宽度x高度');
+      return;
+    }
+
+    const width = parseInt(match[1]);
+    const height = parseInt(match[2]);
+
+    // 验证范围
+    if (width < 320 || width > 7680) {
+      this.showToast('宽度必须在 320-7680 之间');
+      return;
+    }
+    if (height < 240 || height > 4320) {
+      this.showToast('高度必须在 240-4320 之间');
+      return;
+    }
+    
+    // 验证偶数并提供修正建议
+    if (width % 2 !== 0 || height % 2 !== 0) {
+      const correctedWidth = width % 2 !== 0 ? width + 1 : width;
+      const correctedHeight = height % 2 !== 0 ? height + 1 : height;
+      this.showToast(`宽高必须为偶数，建议使用: ${correctedWidth}x${correctedHeight}`, 3000);
+      return;
+    }
+
+    // 检查是否已存在
+    if (this.customResolutions.includes(resolution)) {
+      this.showToast('该分辨率已存在');
+      return;
+    }
+
+    // 添加并保存
+    this.customResolutions = [...this.customResolutions, resolution];
+    this.saveCustomResolutions();
+    this.showToast(`已添加: ${resolution}`);
+  }
+
+  /**
+   * 删除单个自定义分辨率
+   */
+  private removeCustomResolution(resolution: string): void {
+    const idx = this.customResolutions.indexOf(resolution);
+    if (idx === -1) {
+      this.showToast('该分辨率不存在');
+      return;
+    }
+    this.customResolutions = this.customResolutions.filter(r => r !== resolution);
+    this.saveCustomResolutions();
+    // 如果当前正在使用被删除的分辨率，回退到 1080p
+    if (this.resolution === resolution) {
+      this.resolution = '1080p';
+      this.saveSetting(SettingsKeys.RESOLUTION, '1080p');
+      this.showToast(`已删除 ${resolution}，分辨率已回退为 1080p`);
+    } else {
+      this.showToast(`已删除: ${resolution}`);
+    }
+  }
+
+  /**
+   * 清空所有自定义分辨率
+   */
+  private clearAllCustomResolutions(): void {
+    if (this.customResolutions.length === 0) {
+      this.showToast('没有自定义分辨率需要清空');
+      return;
+    }
+
+    promptAction.showDialog({
+      title: '确认清空',
+      message: `确定要清空所有 ${this.customResolutions.length} 个自定义分辨率吗？`,
+      buttons: [
+        { text: '确定', color: AppColors.Error },
+        { text: '取消', color: AppColors.TextSecondary }
+      ]
+    }).then((result) => {
+      if (result.index === 0) {
+        this.customResolutions = [];
+        this.saveCustomResolutions();
+        this.showToast('已清空所有自定义分辨率');
+      }
+    });
+  }
+
+  /**
+   * 确认还原默认设置
+   */
+  private confirmResetSettings(): void {
+    promptAction.showDialog({
+      title: '还原默认设置',
+      message: '确定要将所有设置恢复为默认值吗？此操作不可撤销。\n\n已添加的电脑和配对信息不会受到影响。',
+      buttons: [
+        { text: '还原', color: AppColors.Error },
+        { text: '取消', color: AppColors.TextSecondary }
+      ]
+    }).then(async (result) => {
+      if (result.index === 0) {
+        try {
+          const context = getContext(this) as common.UIAbilityContext;
+          await PreferencesUtil.clear(context);
+          this.loadSettings();
+          this.showToast('已还原默认设置');
+        } catch (e) {
+          this.showToast('还原失败，请重试');
+        }
+      }
+    });
+  }
+
+  /**
+   * 保存自定义分辨率到存储
+   */
+  private saveCustomResolutions(): void {
+    const resStr = this.customResolutions.join(',');
+    this.saveSetting(SettingsKeys.CUSTOM_RESOLUTIONS, resStr);
+  }
+
+  private showFpsPicker(): void {
+    const supportedRates = getSupportedDisplayRates();
+    // Older systems may not expose capabilities. Keep standard choices available.
+    const deviceRefreshRate = supportedRates.length > 0 ? Math.max(...supportedRates) : 144;
+
+    // 基础帧率选项（所有设备通用）
+    const presetOptions: PickerOption[] = [
+      { title: '30 FPS', subtitle: '流畅，低带宽', value: '30 FPS' } as PickerOption,
+      { title: '60 FPS', subtitle: '推荐，平衡', value: '60 FPS' } as PickerOption,
+    ];
+
+    // 根据设备刷新率动态添加高帧率选项
+    if (deviceRefreshRate >= 90) {
+      presetOptions.push({ title: '90 FPS', subtitle: '高刷新率', value: '90 FPS' } as PickerOption);
+    }
+    if (deviceRefreshRate >= 120) {
+      presetOptions.push(
+        { title: '119.88 FPS', subtitle: '视频标准 (NTSC)', value: '119.88 FPS' } as PickerOption,
+        { title: '120 FPS', subtitle: '极致体验', value: '120 FPS' } as PickerOption
+      );
+    }
+    if (deviceRefreshRate >= 144) {
+      presetOptions.push({ title: '144 FPS', subtitle: '高刷屏专属', value: '144 FPS' } as PickerOption);
+    }
+    // 如果设备刷新率不在预设中（如 165Hz, 240Hz 等），动态添加
+    const knownRates = [30, 60, 90, 120, 144];
+    if (deviceRefreshRate > 60 && !knownRates.includes(deviceRefreshRate)) {
+      presetOptions.push({
+        title: `${deviceRefreshRate} FPS`,
+        subtitle: `匹配设备屏幕 (${deviceRefreshRate}Hz)`,
+        value: `${deviceRefreshRate} FPS`
+      } as PickerOption);
+    }
+    
+    // 如果有自定义帧率，添加到选项中
+    const customOptions: PickerOption[] = [];
+    if (this.customFps > 0) {
+      customOptions.push({
+        title: `${this.customFps} FPS`,
+        subtitle: '自定义帧率',
+        value: `自定义:${this.customFps}`
+      } as PickerOption);
+    }
+    
+    // 添加"自定义..."选项
+    const customActionOption: PickerOption = {
+      title: '自定义...',
+      subtitle: '输入任意帧率值',
+      value: 'custom_input'
+    } as PickerOption;
+    
+    const options = [...presetOptions, ...customOptions, customActionOption];
+    
+    const config: PickerConfig = {
+      title: '选择帧率',
+      subtitle: supportedRates.length > 0 ? `屏幕最高 ${deviceRefreshRate}Hz · 更高帧率需要更多带宽` : '屏幕最高刷新率未知 · 请按设备能力选择',
+      selectedValue: this.fps,
+      options: options,
+      onSelect: (option: PickerOption) => {
+        const value = option.value as string;
+        if (value === 'custom_input') {
+          // 延迟打开输入框，等待 picker dialog 关闭动画完成
+          setTimeout(() => this.showCustomFpsInput(), 200);
+        } else if (value.startsWith('自定义:')) {
+          // 选择了已保存的自定义帧率
+          this.fps = value;
+          this.saveSetting(SettingsKeys.FPS, value);
+        } else {
+          // 选择了预设帧率
+          this.fps = value;
+          this.saveSetting(SettingsKeys.FPS, value);
+        }
+      }
+    };
+    this.showPicker(config);
+  }
+
+  /**
+   * 显示 Guide/Mode 键动作选择器
+   */
+  private showHomeButtonActionPicker(): void {
+    const options: PickerOption[] = [
+      { title: '发送 Guide 键', subtitle: 'Xbox Guide / PS Home / Mode', value: 'guide' } as PickerOption,
+      { title: '发送 Select 键', subtitle: '返回/选择键', value: 'select' } as PickerOption,
+      { title: '切换鼠标模式', subtitle: '切换触摸屏鼠标模拟', value: 'toggle_mouse' } as PickerOption,
+      { title: '切换性能图层', subtitle: '显示/隐藏性能监控', value: 'toggle_perf' } as PickerOption,
+      { title: '显示游戏菜单', subtitle: '打开 ESC 菜单', value: 'show_menu' } as PickerOption,
+      { title: '无动作', subtitle: '忽略此按键', value: 'none' } as PickerOption,
+    ];
+
+    const config: PickerConfig = {
+      title: 'Guide/Mode 键动作',
+      subtitle: '设置 2313 兼容键的动作；部分手柄会把 Home/Guide/Mode 映射到这里',
+      selectedValue: this.gcButtonHomeMapping,
+      options: options,
+      onSelect: (option: PickerOption) => {
+        const value = option.value as string;
+        this.gcButtonHomeMapping = value;
+        this.saveSetting(SettingsKeys.GC_BUTTON_HOME_MAPPING, value);
+        // 通知 GamepadManager 更新映射
+        GamepadManager.getInstance().updateGCButton2313Action(value as 'guide' | 'select' | 'toggle_mouse' | 'toggle_perf' | 'show_menu' | 'none');
+      }
+    };
+    this.showPicker(config);
+  }
+
+  /**
+   * 显示自定义帧率输入框
+   */
+  private showCustomFpsInput(): void {
+    this.textInputTitle = '自定义帧率';
+    this.textInputPlaceholder = '输入帧率值 (如: 144)';
+    this.textInputValue = this.customFps > 0 ? this.customFps.toString() : '';
+    this.textInputCallback = (value: string) => {
+      if (value && value.trim()) {
+        this.setCustomFps(value.trim());
+      }
+    };
+    this.bottomSheetType = 'text';
+    this.showTextInputDialog = true;
+  }
+
+  /**
+   * 设置自定义帧率
+   */
+  private setCustomFps(value: string): void {
+    const fps = parseInt(value);
+    
+    // 验证帧率值
+    if (isNaN(fps)) {
+      this.showToast('请输入有效的数字');
+      return;
+    }
+    
+    if (fps < 10 || fps > 360) {
+      this.showToast('帧率必须在 10-360 之间');
+      return;
+    }
+    
+    // 保存自定义帧率
+    this.customFps = fps;
+    this.fps = `自定义:${fps}`;
+    this.saveSetting(SettingsKeys.CUSTOM_FPS, fps);
+    this.saveSetting(SettingsKeys.FPS, this.fps);
+    
+    this.showToast(`已设置帧率为 ${fps} FPS`);
+  }
+
+  // 已转换为 Slider，保留空方法以防未来需要
+  private showBitratePicker(): void { }
+
+  private showAudioConfigPicker(): void {
+    const options: PickerOption[] = [
+      { title: '立体声', subtitle: '双声道', value: '立体声' } as PickerOption,
+      { title: '5.1 环绕', subtitle: '家庭影院', value: '5.1 环绕' } as PickerOption,
+      { title: '7.1 环绕', subtitle: '专业音响', value: '7.1 环绕' } as PickerOption
+    ];
+    const config: PickerConfig = {
+      title: '选择音频配置',
+      subtitle: '根据您的音响设备选择',
+      selectedValue: this.audioConfig,
+      options: options,
+      onSelect: (option: PickerOption) => {
+        this.audioConfig = option.value as string;
+        this.saveSetting(SettingsKeys.AUDIO_CONFIG, option.value as string);
+      }
+    };
+    this.showPicker(config);
+  }
+
+  private showVideoFormatPicker(): void {
+    const caps = this.decoderCapabilities;
+    const h264Supported = caps?.supportsH264 ?? true;
+    const hevcSupported = caps?.supportsHEVC ?? false;
+    const av1Supported = caps?.supportsAV1 ?? false;
+    
+    const options: PickerOption[] = [
+      { title: '自动', subtitle: '系统自动选择', value: '自动' } as PickerOption,
+      { 
+        title: 'H.264', 
+        subtitle: h264Supported ? '兼容性最好' : '设备不支持', 
+        value: 'H.264' 
+      } as PickerOption,
+      { 
+        title: 'HEVC', 
+        subtitle: hevcSupported ? 'H.265，高效压缩' : '设备不支持（可能是模拟器）', 
+        value: 'HEVC' 
+      } as PickerOption,
+      { 
+        title: 'AV1', 
+        subtitle: av1Supported ? '最新编码，高效压缩' : '设备不支持', 
+        value: 'AV1' 
+      } as PickerOption
+    ];
+    
+    // 生成能力信息提示
+    let supportInfo = '设备支持: ';
+    const supportedCodecs: string[] = [];
+    if (h264Supported) supportedCodecs.push('H.264');
+    if (hevcSupported) supportedCodecs.push('HEVC');
+    if (av1Supported) supportedCodecs.push('AV1');
+    supportInfo += supportedCodecs.length > 0 ? supportedCodecs.join(', ') : '无硬件解码';
+    
+    const config: PickerConfig = {
+      title: '选择视频格式',
+      subtitle: supportInfo,
+      selectedValue: this.videoFormat,
+      options: options,
+      onSelect: (option: PickerOption) => {
+        const value = option.value as string;
+        // 警告用户选择了不支持的编码
+        if ((value === 'HEVC' && !hevcSupported) || 
+            (value === 'AV1' && !av1Supported) ||
+            (value === 'H.264' && !h264Supported)) {
+          this.showToast(`警告: 设备不支持 ${value}，串流可能失败`, 3000);
+        }
+        this.videoFormat = value;
+        this.saveSetting(SettingsKeys.VIDEO_FORMAT, value);
+        // H.264 不支持 HDR，自动禁用
+        if (value === 'H.264' && this.enableHdr) {
+          this.enableHdr = false;
+          this.saveSetting(SettingsKeys.ENABLE_HDR, false);
+          ToastQueue.show({
+            message: 'H.264 不支持 HDR，已自动关闭',
+            duration: 2000
+          });
+        }
+      }
+    };
+    this.showPicker(config);
+  }
+
+  private showHdrModePicker(): void {
+    const options: PickerOption[] = [
+      { 
+        title: 'HDR10 (PQ)', 
+        subtitle: '标准 HDR10，使用 ST.2084 传输函数', 
+        value: 'HDR10' 
+      } as PickerOption,
+      { 
+        title: 'HLG', 
+        subtitle: '需要 Sunshine Foundation 版本，适用于 HDR Vivid', 
+        value: 'HLG' 
+      } as PickerOption
+    ];
+    
+    const config: PickerConfig = {
+      title: '选择 HDR 模式',
+      subtitle: 'HLG 模式需要 Sunshine Foundation 版本支持',
+      selectedValue: this.hdrMode,
+      options: options,
+      onSelect: (option: PickerOption) => {
+        const value = option.value as string;
+        this.hdrMode = value;
+        this.saveSetting(SettingsKeys.HDR_MODE, value);
+      }
+    };
+    this.showPicker(config);
+  }
+
+  /**
+   * 显示开源库说明对话框
+   */
+  private showOpenSourceLicenses(): void {
+    this.licensesDialogController = new CustomDialogController({
+      builder: OpenSourceLicensesDialog(),
+      alignment: DialogAlignment.Center,
+      customStyle: true,
+      backgroundColor: Color.Transparent
+    });
+    this.licensesDialogController.open();
+  }
+
+  /**
+   * 显示更新日志对话框
+   */
+  private async showChangelog(): Promise<void> {
+    const context = getContext(this) as common.Context;
+    const entries = await loadChangelog(context);
+    this.changelogDialogController = new CustomDialogController({
+      builder: ChangelogDialog({ entries: entries }),
+      alignment: DialogAlignment.Center,
+      customStyle: true,
+      backgroundColor: Color.Transparent
+    });
+    this.changelogDialogController.open();
+  }
+
+  /**
+   * 显示隐私政策对话框
+   */
+  private showPrivacyPolicy(): void {
+    this.privacyDialogController = new CustomDialogController({
+      builder: PrivacyPolicyDialog(),
+      alignment: DialogAlignment.Center,
+      customStyle: true,
+      backgroundColor: Color.Transparent
+    });
+    this.privacyDialogController.open();
+  }
+
+  /**
+   * 使用系统浏览器打开 URL
+   */
+  private openUrl(url: string): void {
+    try {
+      const context = getContext(this) as common.UIAbilityContext;
+      const want: Want = {
+        action: 'ohos.want.action.viewData',
+        uri: url
+      };
+      context.startAbility(want);
+    } catch (err) {
+      Logger.error('SettingsPageV2', '打开链接失败:', err);
+      ToastQueue.show({ message: '打开链接失败', duration: 2000 });
+    }
+  }
+
+  // 已转换为 Slider
+  private showDeadzonePicker(): void { }
+  private showOscOpacityPicker(): void { }
+  
+  // 已转换为 Slider
+  private showHostScalePicker(): void { }
+  private showMicBitratePicker(): void { }
+  private showVibrateFallbackStrengthPicker(): void { }
+  private showDoubleTapThresholdPicker(): void { }
+  private showEnhancedTouchZoneDividerPicker(): void { }
+  private showPointerVelocityFactorPicker(): void { }
+  
+  /** 振动模式分段项下方的说明文字，随所选模式变化。 */
+  private getVibrationModeSubtitle(): string {
+    switch (this.vibrationMode) {
+      case '仅手柄': return '只使用手柄振动';
+      case '仅设备': return '只使用设备振动';
+      case '协同': return '手柄承载高频细节，机身补充低频量感';
+      case '自动':
+      default: return '有手柄用手柄振动，无手柄用设备振动';
+    }
+  }
+  private showAudioVibrationSceneModePicker(): void {
+    const options: PickerOption[] = [
+      { title: '游戏/电影', subtitle: '持续低频驱动，适合爆炸、枪声、引擎等场景', value: '游戏/电影' } as PickerOption,
+      { title: '音乐/节奏', subtitle: '鼓点节拍检测，按节奏脉冲振动', value: '音乐/节奏' } as PickerOption,
+      { title: '自动', subtitle: '根据音频特征自动切换振动策略', value: '自动' } as PickerOption
+    ];
+    const config: PickerConfig = {
+      title: '选择音频振动场景',
+      subtitle: '不同场景使用不同的振动策略',
+      selectedValue: this.audioVibrationSceneMode,
+      options: options,
+      onSelect: (option: PickerOption) => {
+        this.audioVibrationSceneMode = option.value as string;
+        this.saveSetting(SettingsKeys.AUDIO_VIBRATION_SCENE_MODE, option.value as string);
+      }
+    };
+    this.showPicker(config);
+  }
+  private showLongPressFlatRegionPicker(): void { }
+  
+  private showScreenCombinationModePicker(): void {
+    const options: PickerOption[] = [
+      { title: '主机默认', subtitle: '使用 Sunshine 服务端配置', value: '主机默认' } as PickerOption,
+      { title: '不修改', subtitle: '保持当前屏幕布局不变', value: '不修改' } as PickerOption,
+      { title: '确保开启', subtitle: '确保串流屏幕已点亮', value: '确保开启' } as PickerOption,
+      { title: '设为主屏', subtitle: '将串流屏幕设为主显示器', value: '设为主屏' } as PickerOption,
+      { title: '仅此屏幕', subtitle: '仅使用串流屏幕，关闭其他显示器', value: '仅此屏幕' } as PickerOption
+    ];
+    const config: PickerConfig = {
+      title: '选择屏幕组合模式',
+      subtitle: '选择多屏组合方式',
+      selectedValue: this.screenCombinationMode,
+      options: options,
+      onSelect: (option: PickerOption) => {
+        this.screenCombinationMode = option.value as string;
+        this.saveSetting(SettingsKeys.SCREEN_COMBINATION_MODE, option.value as string);
+      }
+    };
+    this.showPicker(config);
+  }
+  
+  private showPerfOverlayOrientationPicker(): void {
+    const options: PickerOption[] = [
+      { title: '水平', value: '水平' } as PickerOption,
+      { title: '垂直', value: '垂直' } as PickerOption
+    ];
+    const config: PickerConfig = {
+      title: '选择性能覆盖层方向',
+      subtitle: '选择显示方向',
+      selectedValue: this.perfOverlayOrientation,
+      options: options,
+      onSelect: (option: PickerOption) => {
+        this.perfOverlayOrientation = option.value as string;
+        this.saveSetting(SettingsKeys.PERF_OVERLAY_ORIENTATION, option.value as string);
+      }
+    };
+    this.showPicker(config);
+  }
+  
+  private showPerfOverlayItemsPicker(): void {
+    // 所有可用项目 - 使用常量
+    const allItems: PerfOverlayItemOption[] = [
+      new PerfOverlayItemOption('resolution', PerfLabels.RESOLUTION),
+      new PerfOverlayItemOption('decoder', PerfLabels.DECODER),
+      new PerfOverlayItemOption('render_fps', PerfLabels.FPS),
+      new PerfOverlayItemOption('packet_loss', PerfLabels.PACKET_LOSS),
+      new PerfOverlayItemOption('bitrate', PerfLabels.BITRATE),
+      new PerfOverlayItemOption('network_latency', PerfLabels.NETWORK),
+      new PerfOverlayItemOption('decode_latency', PerfLabels.DECODE),
+      new PerfOverlayItemOption('host_latency', PerfLabels.HOST),
+      new PerfOverlayItemOption('battery', PerfLabels.BATTERY)
+    ];
+    
+    // 转换为 DialogMultiOptionItem 格式
+    const options: DialogMultiOptionItem[] = allItems.map((item: PerfOverlayItemOption): DialogMultiOptionItem => {
+      return {
+        key: item.key,
+        title: item.title
+      } as DialogMultiOptionItem;
+    });
+    
+    this.multiOptionPickerDialogConfig = {
+      title: '选择显示项目',
+      subtitle: '点击项目切换显示/隐藏',
+      options: options,
+      selectedKeys: [...this.perfOverlayItems],
+      minSelected: 1,
+      onSelectionChange: (selectedKeys: string[]) => {
+        this.perfOverlayItems = selectedKeys;
+        this.saveSetting(SettingsKeys.PERF_OVERLAY_ITEMS, this.perfOverlayItems.join(','));
+      }
+    };
+    
+    // 创建并打开弹窗
+    this.multiOptionPickerDialogController = new CustomDialogController({
+      builder: MultiOptionPickerDialog({
+        config: this.multiOptionPickerDialogConfig
+      }),
+      alignment: DialogAlignment.Bottom,
+      customStyle: true,
+      backgroundColor: Color.Transparent
+    });
+    this.multiOptionPickerDialogController.open();
+  }
+  
+  private showEscMenuKeyPicker(): void {
+    const options: PickerOption[] = [
+      { title: 'ESC', value: 'ESC' } as PickerOption,
+      { title: 'F1', value: 'F1' } as PickerOption,
+      { title: 'F12', value: 'F12' } as PickerOption,
+      { title: '~', value: '~' } as PickerOption
+    ];
+    const config: PickerConfig = {
+      title: '选择 ESC 菜单按键',
+      subtitle: '选择触发菜单的按键',
+      selectedValue: this.escMenuKey,
+      options: options,
+      onSelect: (option: PickerOption) => {
+        this.escMenuKey = option.value as string;
+        this.saveSetting(SettingsKeys.ESC_MENU_KEY, option.value as string);
+      }
+    };
+    this.showPicker(config);
+  }
+  
+  private getBackgroundImageTypeLabel(): string {
+    switch (this.backgroundImageType) {
+      case 'default':
+      case 'pipw':
+        return 'Pipw 二次元 (默认)';
+      case 'picsum':
+        return 'Lorem Picsum (摄影)';
+      case 'api':
+        return '自定义 URL';
+      case 'none':
+        return '关闭';
+      default:
+        return 'Pipw 二次元 (默认)';
+    }
+  }
+  
+  private showBackgroundImageTypePicker(): void {
+    const options: PickerOption[] = [
+      { title: 'Pipw 二次元', subtitle: '二次元壁纸 (默认)', value: 'default' } as PickerOption,
+      { title: 'Lorem Picsum', subtitle: '摄影壁纸 (Unsplash授权)', value: 'picsum' } as PickerOption,
+      { title: '自定义 URL', subtitle: '使用自定义图片链接', value: 'api' } as PickerOption,
+      { title: '关闭', subtitle: '不使用背景图片', value: 'none' } as PickerOption
+    ];
+    const config: PickerConfig = {
+      title: '选择背景图片类型',
+      subtitle: '选择背景图片来源',
+      selectedValue: this.backgroundImageType,
+      options: options,
+      onSelect: async (option: PickerOption) => {
+        this.backgroundImageType = option.value as string;
+        const bgUtil = BackgroundImageUtil.getInstance();
+        // 通过 BackgroundImageUtil 设置类型（会自动清除缓存、重置状态）
+        await bgUtil.setBackgroundImageType(option.value as BackgroundImageType);
+        // 选择关闭时，额外清除本地缓存文件
+        if (option.value === 'none') {
+          bgUtil.disableBackgroundImage();
+        }
+        this.showToast(`背景图片设置为: ${option.title}，重启应用后生效`);
+      }
+    };
+    this.showPicker(config);
+  }
+  
+  private showBackgroundImageUrlInput(): void {
+    this.textInputTitle = '设置自定义背景图片 URL';
+    this.textInputPlaceholder = '输入图片网址，留空使用默认 API';
+    this.textInputValue = this.backgroundImageUrl;
+    this.textInputCallback = (value: string) => {
+      this.backgroundImageUrl = value;
+      this.saveSetting(SettingsKeys.BACKGROUND_IMAGE_URL, value);
+      if (value) {
+        this.backgroundImageType = 'api';
+        this.saveSetting(SettingsKeys.BACKGROUND_IMAGE_TYPE, 'api');
+        this.showToast('自定义背景图片已设置');
+      } else {
+        this.backgroundImageType = 'default';
+        this.saveSetting(SettingsKeys.BACKGROUND_IMAGE_TYPE, 'default');
+        this.showToast('已恢复使用默认 API');
+      }
+    };
+    this.showTextInputDialog = true;
+  }
+
+  private getDeveloperModeSubtitle(): string {
+    if (this.developerUnlockBusy) {
+      return '正在验证 GitHub Star';
+    }
+    if (this.developerMode) {
+      return '已开启';
+    }
+    if (this.devKeyActivated) {
+      return DeveloperUnlockService.isGitHubConfigured() ? '已验证 Star，点击开启' : '已授权，点击开启';
+    }
+    if (DeveloperUnlockService.isGitHubConfigured()) {
+      return `验证 ${DeveloperUnlockService.projectFullName()} Star 后开启`;
+    }
+    return '需要激活码';
+  }
+
+  private async toggleDeveloperMode(): Promise<void> {
+    if (this.developerUnlockBusy) {
+      ToastQueue.show({ message: '开发者模式验证正在进行中', duration: 2000 });
+      return;
+    }
+
+    if (this.developerMode) {
+      this.developerMode = false;
+      await this.saveSetting(SettingsKeys.DEVELOPER_MODE, false);
+      return;
+    }
+
+    if (this.devKeyActivated) {
+      this.developerMode = true;
+      await this.saveSetting(SettingsKeys.DEVELOPER_MODE, true);
+      return;
+    }
+
+    if (DeveloperUnlockService.isGitHubConfigured()) {
+      this.showDeveloperUnlockDialog();
+    } else {
+      this.developerMode = true;
+      this.showDevKeyActivation();
+    }
+  }
+
+  private async showDeveloperUnlockDialog(): Promise<void> {
+    const pending = await DeveloperUnlockService.restorePendingDeviceCode();
+    if (pending) {
+      const result = await this.pollDeveloperPendingDeviceCode(false, true);
+      if (result.status === DeveloperUnlockStatus.PENDING && result.deviceCode &&
+        !this.devKeyActivated && !this.developerMode) {
+        this.showDeveloperDeviceCodeDialog(result.deviceCode);
+      }
+      return;
+    }
+
+    promptAction.showDialog({
+      title: '激活开发者模式',
+      message: `开发者功能面向项目支持者开放。登录 GitHub 后，应用会验证当前账号是否 Star 了 ${DeveloperUnlockService.projectFullName()}。\n\n说明：该验证会跳转 GitHub，并仅用于确认 Star 状态。`,
+      buttons: [
+        { text: '验证 Star', color: AppColors.Primary },
+        { text: '打开项目', color: AppColors.TextSecondary },
+        { text: '激活码', color: AppColors.TextSecondary }
+      ]
+    }).then((result) => {
+      if (result.index === 0) {
+        this.startDeveloperUnlockVerification();
+      } else if (result.index === 1) {
+        this.openUrl(DeveloperUnlockService.projectUrl());
+      } else if (result.index === 2) {
+        this.developerMode = true;
+        this.showDevKeyActivation();
+      }
+    });
+  }
+
+  private async startDeveloperUnlockVerification(): Promise<void> {
+    if (this.developerUnlockBusy) {
+      ToastQueue.show({ message: '开发者模式验证正在进行中', duration: 2000 });
+      return;
+    }
+
+    await this.requestDeveloperDeviceCode();
+  }
+
+  private async resumeDeveloperPendingUnlock(): Promise<void> {
+    if (this.isLoading || !DeveloperUnlockService.isGitHubConfigured() || this.developerMode || this.devKeyActivated ||
+      this.developerUnlockBusy || this.developerPendingResumeBusy || this.developerPendingDialogVisible) {
+      return;
+    }
+
+    this.developerPendingResumeBusy = true;
+    try {
+      const pending = await DeveloperUnlockService.restorePendingDeviceCode();
+      if (!pending) {
+        return;
+      }
+
+      const result = await this.pollDeveloperPendingDeviceCode(false, true);
+      if (result.status === DeveloperUnlockStatus.PENDING && result.deviceCode &&
+        !this.devKeyActivated && !this.developerMode) {
+        this.showDeveloperDeviceCodeDialog(result.deviceCode);
+      }
+    } finally {
+      this.developerPendingResumeBusy = false;
+    }
+  }
+
+  private async requestDeveloperDeviceCode(): Promise<void> {
+    this.developerUnlockBusy = true;
+    ToastQueue.show({ message: '正在发起 GitHub 授权...', duration: 2000 });
+    try {
+      const result = await DeveloperUnlockService.requestDeviceCode();
+      await this.applyDeveloperUnlockResult(result, true);
+    } finally {
+      this.developerUnlockBusy = false;
+    }
+  }
+
+  private showDeveloperDeviceCodeDialog(deviceCode: GitHubDeviceCode): void {
+    if (this.developerPendingDialogVisible) {
+      return;
+    }
+
+    this.developerPendingDialogVisible = true;
+    promptAction.showDialog({
+      title: 'GitHub Star 验证',
+      message: `1. 打开授权页并输入代码：${deviceCode.userCode}\n2. 确认已 Star ${DeveloperUnlockService.projectFullName()}\n3. 回到这里点击“我已授权”\n\n授权页：${deviceCode.verificationUri}`,
+      buttons: [
+        { text: '打开授权页', color: AppColors.Primary },
+        { text: '我已授权', color: AppColors.Primary },
+        { text: '打开项目', color: AppColors.TextSecondary }
+      ]
+    }).then((result) => {
+      this.developerPendingDialogVisible = false;
+      if (result.index === 0) {
+        this.openUrl(deviceCode.verificationUriComplete ?? deviceCode.verificationUri);
+      } else if (result.index === 1) {
+        this.pollDeveloperPendingDeviceCode(true, false);
+      } else if (result.index === 2) {
+        this.openUrl(DeveloperUnlockService.projectUrl());
+      }
+    }).catch((err: Error) => {
+      this.developerPendingDialogVisible = false;
+      Logger.warn('SettingsPageV2', `DeveloperUnlockService: 授权弹窗已关闭: ${err}`);
+    });
+  }
+
+  private async pollDeveloperPendingDeviceCode(
+    showPendingToast: boolean,
+    enforceThrottle: boolean
+  ): Promise<DeveloperUnlockResult> {
+    this.developerUnlockBusy = true;
+    try {
+      const result = await DeveloperUnlockService.pollPendingDeviceCode(enforceThrottle);
+      await this.applyDeveloperUnlockResult(result, showPendingToast);
+      return result;
+    } finally {
+      this.developerUnlockBusy = false;
+    }
+  }
+
+  private async applyDeveloperUnlockResult(
+    result: DeveloperUnlockResult,
+    showPendingToast: boolean
+  ): Promise<void> {
+    switch (result.status) {
+      case DeveloperUnlockStatus.REQUESTED:
+        if (result.deviceCode) {
+          this.showDeveloperDeviceCodeDialog(result.deviceCode);
+        }
+        break;
+      case DeveloperUnlockStatus.PENDING:
+        if (showPendingToast) {
+          ToastQueue.show({ message: '仍在等待 GitHub 授权，请稍后再试', duration: 2500 });
+          if (result.deviceCode && !this.devKeyActivated && !this.developerMode) {
+            this.showDeveloperDeviceCodeDialog(result.deviceCode);
+          }
+        }
+        break;
+      case DeveloperUnlockStatus.VERIFIED:
+        await this.activateDeveloperMode(result.login);
+        break;
+      case DeveloperUnlockStatus.NOT_STARRED:
+        await this.showDeveloperNotStarredDialog();
+        break;
+      case DeveloperUnlockStatus.EXPIRED:
+        if (showPendingToast) {
+          ToastQueue.show({ message: result.message ?? 'GitHub 授权已过期，请重新开始', duration: 2500 });
+        }
+        break;
+      case DeveloperUnlockStatus.FAILED:
+        await this.failDeveloperUnlockVerification(result.message ?? 'GitHub 授权失败');
+        break;
+    }
+  }
+
+  private async activateDeveloperMode(login?: string): Promise<void> {
+    this.developerMode = true;
+    this.devKeyActivated = true;
+    await this.saveSetting(SettingsKeys.DEVELOPER_MODE, true);
+    await this.saveSetting(SettingsKeys.DEV_KEY_ACTIVATED, true);
+    const suffix = login ? `，${login}` : '';
+    ToastQueue.show({ message: `开发者模式已激活${suffix}`, duration: 2500 });
+  }
+
+  private async showDeveloperNotStarredDialog(): Promise<void> {
+    this.developerMode = false;
+    this.devKeyActivated = false;
+    await this.saveSetting(SettingsKeys.DEVELOPER_MODE, false);
+    await this.saveSetting(SettingsKeys.DEV_KEY_ACTIVATED, false);
+    promptAction.showDialog({
+      title: '未检测到 Star',
+      message: `GitHub 授权成功，但当前账号尚未 Star ${DeveloperUnlockService.projectFullName()}。如果刚刚 Star，请稍等片刻后重新验证。`,
+      buttons: [
+        { text: '打开项目', color: AppColors.Primary },
+        { text: '取消', color: AppColors.TextSecondary }
+      ]
+    }).then((result) => {
+      if (result.index === 0) {
+        this.openUrl(DeveloperUnlockService.projectUrl());
+      }
+    });
+  }
+
+  private async failDeveloperUnlockVerification(message: string): Promise<void> {
+    this.developerMode = false;
+    ToastQueue.show({ message: `开发者模式验证失败: ${message}`, duration: 3000 });
+  }
+
+  private async copyLastStreamDiagnostics(): Promise<void> {
+    try {
+      const diagnostics = await PreferencesUtil.get<string>(
+        SettingsKeys.LAST_STREAM_DIAGNOSTICS, '');
+      if (diagnostics.length === 0) {
+        this.showToast('暂无串流诊断数据');
+        return;
+      }
+      const pasteData = pasteboard.createData(
+        pasteboard.MIMETYPE_TEXT_PLAIN, diagnostics);
+      pasteboard.getSystemPasteboard().setDataSync(pasteData);
+      this.showToast('上次串流诊断已复制');
+    } catch (err) {
+      Logger.error('SettingsPageV2', '[SettingsPage] 复制串流诊断失败:', JSON.stringify(err));
+      this.showToast('复制串流诊断失败');
+    }
+  }
+
+  /**
+   * 显示开发者模式激活码输入
+   */
+  private showDevKeyActivation(): void {
+    const context = getContext(this) as common.Context;
+    const deviceId = DevKeyVerifier.getDeviceId(context);
+    if (!deviceId) {
+      this.developerMode = false;
+      ToastQueue.show({ message: '无法获取设备 ID，请先连接一次服务器', duration: 3000 });
+      return;
+    }
+    const displayId = deviceId.toUpperCase();
+    // 自动复制设备 ID 到剪贴板
+    const pasteData = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, displayId);
+    pasteboard.getSystemPasteboard().setDataSync(pasteData);
+    this.textInputTitle = `激活开发者模式\n设备 ID: ${displayId}（已复制）`;
+    this.textInputPlaceholder = '请输入 8 位激活码';
+    this.textInputValue = '';
+    this.textInputCallback = (value: string) => {
+      // 确定按钮点击，清除 dismiss 回调以免重复触发
+      this.textInputDismissCallback = null;
+      if (!value) {
+        this.developerMode = false;
+        return;
+      }
+      if (DevKeyVerifier.verify(deviceId, value)) {
+        this.developerMode = true;
+        this.devKeyActivated = true;
+        this.saveSetting(SettingsKeys.DEVELOPER_MODE, true);
+        this.saveSetting(SettingsKeys.DEV_KEY_ACTIVATED, true);
+        ToastQueue.show({ message: '开发者模式已激活', duration: 2000 });
+      } else {
+        this.developerMode = false;
+        ToastQueue.show({ message: '激活码无效', duration: 2000 });
+      }
+    };
+    // 弹窗被取消/滑动关闭时回退 Toggle
+    this.textInputDismissCallback = () => {
+      this.developerMode = false;
+    };
+    this.showTextInputDialog = true;
+  }
+}
+
+/**
+ * 开源库信息接口
+ */
+interface OpenSourceLibrary {
+  name: string;
+  license: string;
+  licenseType: string;
+  desc: string;
+  url: string;
+  showInAbout: boolean;
+}
+
+interface OpenSourceManifest {
+  schemaVersion: number;
+  libraries: OpenSourceLibrary[];
+}
+
+function loadOpenSourceLibraries(context: common.Context): OpenSourceLibrary[] {
+  try {
+    const rawData = context.resourceManager.getRawFileContentSync(
+      'open_source_libraries.json');
+    const decoder = util.TextDecoder.create('utf-8');
+    const manifest = JSON.parse(
+      decoder.decodeToString(rawData)) as OpenSourceManifest;
+    if (manifest.schemaVersion !== 1) {
+      Logger.error('SettingsPageV2', 
+        `[OpenSource] 不支持的清单版本: ${manifest.schemaVersion}`);
+      return [];
+    }
+    return manifest.libraries.filter(
+      (library: OpenSourceLibrary): boolean => library.showInAbout);
+  } catch (error) {
+    Logger.error('SettingsPageV2', `[OpenSource] 加载开源库清单失败: ${error}`);
+    return [];
+  }
+}
+
+/**
+ * 隐私政策章节接口
+ */
+interface PrivacySection {
+  title: string;
+  content: string;
+}
+
+/**
+ * 开源库说明对话框
+ */
+@CustomDialog
+struct OpenSourceLicensesDialog {
+  controller: CustomDialogController;
+
+  @State private libraries: OpenSourceLibrary[] = [];
+
+  aboutToAppear(): void {
+    const context = getContext(this) as common.Context;
+    this.libraries = loadOpenSourceLibraries(context);
+  }
+
+  build() {
+    Column() {
+      // 标题栏
+      Row() {
+        Text('开源库说明')
+          .fontSize(20)
+          .fontWeight(FontWeight.Bold)
+          .fontColor(AppColors.TextPrimary)
+        Blank()
+        Text('关闭')
+          .fontSize(14)
+          .fontColor(AppColors.Primary)
+          .onClick(() => {
+            this.controller.close();
+          })
+      }
+      .width('100%')
+      .padding({ left: 20, right: 20, top: 20, bottom: 12 })
+
+      // 说明文字
+      Text('本应用基于 Moonlight 开源项目开发，遵循 GPLv3 协议。以下是使用的开源库：')
+        .fontSize(14)
+        .fontColor(AppColors.TextSecondary)
+        .padding({ left: 20, right: 20, bottom: 12 })
+        .width('100%')
+
+      // 库列表
+      List({ space: 8 }) {
+        ForEach(this.libraries, (lib: OpenSourceLibrary) => {
+          ListItem() {
+            Column({ space: 4 }) {
+              Row() {
+                Text(lib.name)
+                  .fontSize(16)
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor(AppColors.TextPrimary)
+                Blank()
+                Text(lib.license)
+                  .fontSize(12)
+                  .fontColor(AppColors.Primary)
+                  .padding({ left: 8, right: 8, top: 2, bottom: 2 })
+                  .backgroundColor(AppColors.PrimaryGlow)
+                  .borderRadius(4)
+              }
+              .width('100%')
+
+              Text(lib.desc)
+                .fontSize(13)
+                .fontColor(AppColors.TextSecondary)
+                .width('100%')
+
+              if (lib.url.length > 0) {
+                Text(lib.url)
+                  .fontSize(12)
+                  .fontColor(AppColors.TextTertiary)
+                  .width('100%')
+              }
+            }
+            .width('100%')
+            .padding(12)
+            .backgroundColor(AppColors.CardBackground)
+            .borderRadius(8)
+          }
+        })
+      }
+      .width('100%')
+      .layoutWeight(1)
+      .padding({ left: 20, right: 20 })
+      .scrollBar(BarState.Off)
+
+      // 底部说明
+      Text('完整的开源库说明请查看项目仓库中的 OPEN_SOURCE_LICENSES.md')
+        .fontSize(12)
+        .fontColor(AppColors.TextTertiary)
+        .padding(20)
+        .width('100%')
+        .textAlign(TextAlign.Center)
+    }
+    .width('90%')
+    .height('70%')
+    .backgroundColor(AppColors.Background)
+    .borderRadius(16)
+    .transition(TransitionEffect.OPACITY.animation({ duration: AppAnimation.Normal, curve: Curve.EaseOut })
+      .combine(TransitionEffect.scale({ x: 0.96, y: 0.96 }).animation({ duration: AppAnimation.Normal, curve: Curve.EaseOut })))
+  }
+}
+
+/**
+ * 隐私政策对话框
+ */
+@CustomDialog
+struct PrivacyPolicyDialog {
+  controller: CustomDialogController;
+
+  // 隐私政策章节
+  private sections: PrivacySection[] = [
+    { 
+      title: '数据收集', 
+      content: '本应用不会主动收集、存储或传输任何用户的个人身份信息。所有配置数据（如服务器地址、偏好设置）仅存储在您的设备本地。若您主动使用 GitHub Star 验证开发者模式，仅会本地保存验证状态和 GitHub 登录名。'
+    } as PrivacySection,
+    { 
+      title: '网络通信', 
+      content: '应用主要在您的本地网络内与电脑建立连接，用于传输游戏音视频流和输入指令。仅当您主动使用开发者模式的 GitHub Star 验证时，应用会连接 GitHub OAuth 与 GitHub API。'
+    } as PrivacySection,
+    { 
+      title: '权限使用', 
+      content: '• 网络权限：建立与电脑的连接\n• 麦克风：语音聊天功能（可选）\n• 振动：手柄振动反馈\n• 传感器：体感控制功能（可选）'
+    } as PrivacySection,
+    { 
+      title: '第三方服务', 
+      content: '本应用不集成任何第三方分析或广告服务。GitHub OAuth Device Flow 和 GitHub API 仅用于可选的开发者模式 Star 验证，不参与游戏串流核心功能。'
+    } as PrivacySection,
+    { 
+      title: '开源合规', 
+      content: '本应用基于 Moonlight 项目开发，遵循 GPLv3 开源协议。源代码可在 GitHub 获取。'
+    } as PrivacySection
+  ];
+
+  build() {
+    Column() {
+      // 标题栏
+      Row() {
+        Text('隐私政策')
+          .fontSize(20)
+          .fontWeight(FontWeight.Bold)
+          .fontColor(AppColors.TextPrimary)
+        Blank()
+        Text('关闭')
+          .fontSize(14)
+          .fontColor(AppColors.Primary)
+          .onClick(() => {
+            this.controller.close();
+          })
+      }
+      .width('100%')
+      .padding({ left: 20, right: 20, top: 20, bottom: 12 })
+
+      // 概述
+      Text('OpenRemoteDesk 尊重并保护您的隐私。以下是我们的隐私政策摘要：')
+        .fontSize(14)
+        .fontColor(AppColors.TextSecondary)
+        .padding({ left: 20, right: 20, bottom: 12 })
+        .width('100%')
+
+      // 政策章节列表
+      List({ space: 12 }) {
+        ForEach(this.sections, (section: PrivacySection) => {
+          ListItem() {
+            Column({ space: 8 }) {
+              Text(section.title)
+                .fontSize(16)
+                .fontWeight(FontWeight.Medium)
+                .fontColor(AppColors.TextPrimary)
+                .width('100%')
+
+              Text(section.content)
+                .fontSize(14)
+                .fontColor(AppColors.TextSecondary)
+                .width('100%')
+                .lineHeight(20)
+            }
+            .width('100%')
+            .padding(12)
+            .backgroundColor(AppColors.CardBackground)
+            .borderRadius(8)
+          }
+        })
+      }
+      .width('100%')
+      .layoutWeight(1)
+      .padding({ left: 20, right: 20 })
+      .scrollBar(BarState.Off)
+
+      // 底部说明
+      Text('完整隐私政策请查看项目仓库中的 PRIVACY_POLICY.md\n最后更新：2025年1月')
+        .fontSize(12)
+        .fontColor(AppColors.TextTertiary)
+        .padding(20)
+        .width('100%')
+        .textAlign(TextAlign.Center)
+    }
+    .width('90%')
+    .height('70%')
+    .backgroundColor(AppColors.Background)
+    .borderRadius(16)
+    .transition(TransitionEffect.OPACITY.animation({ duration: AppAnimation.Normal, curve: Curve.EaseOut })
+      .combine(TransitionEffect.scale({ x: 0.96, y: 0.96 }).animation({ duration: AppAnimation.Normal, curve: Curve.EaseOut })))
+  }
+}
+
+/**
+ * 更新日志对话框
+ */
+@CustomDialog
+struct ChangelogDialog {
+  controller: CustomDialogController;
+  entries: ChangelogEntry[] = [];
+
+  build() {
+    Column() {
+      // 标题栏
+      Row() {
+        Text('更新日志')
+          .fontSize(20)
+          .fontWeight(FontWeight.Bold)
+          .fontColor(AppColors.TextPrimary)
+        Blank()
+        Text('关闭')
+          .fontSize(14)
+          .fontColor(AppColors.Primary)
+          .onClick(() => {
+            this.controller.close();
+          })
+      }
+      .width('100%')
+      .padding({ left: 20, right: 20, top: 20, bottom: 12 })
+
+      // 版本列表
+      List({ space: 16 }) {
+        ForEach(this.entries, (entry: ChangelogEntry, index: number) => {
+          ListItem() {
+            Column({ space: 8 }) {
+              // 版本号 + 日期 + 标记
+              Row() {
+                Text(`v${entry.version}`)
+                  .fontSize(18)
+                  .fontWeight(FontWeight.Bold)
+                  .fontColor(AppColors.TextPrimary)
+                if (index === 0) {
+                  Text('最新')
+                    .fontSize(11)
+                    .fontColor(AppColors.Primary)
+                    .padding({ left: 6, right: 6, top: 2, bottom: 2 })
+                    .backgroundColor(AppColors.PrimaryGlow)
+                    .borderRadius(4)
+                    .margin({ left: 8 })
+                }
+                Blank()
+                Text(entry.date)
+                  .fontSize(13)
+                  .fontColor(AppColors.TextTertiary)
+              }
+              .width('100%')
+
+              // 版本摘要
+              if (entry.summary !== undefined && entry.summary!.length > 0) {
+                Text(entry.summary!)
+                  .fontSize(14)
+                  .fontColor(AppColors.TextSecondary)
+                  .width('100%')
+              }
+
+              // 变更列表
+              Column({ space: 6 }) {
+                ForEach(entry.changes, (change: ChangeItem) => {
+                  Row({ space: 8 }) {
+                    Text(getChangeTypeConfig(change.type).label)
+                      .fontSize(11)
+                      .fontColor('#FFFFFF')
+                      .padding({ left: 6, right: 6, top: 2, bottom: 2 })
+                      .backgroundColor(getChangeTypeConfig(change.type).color)
+                      .borderRadius(4)
+                      .flexShrink(0)
+                    Text(change.text)
+                      .fontSize(14)
+                      .fontColor(AppColors.TextPrimary)
+                      .layoutWeight(1)
+                  }
+                  .width('100%')
+                  .alignItems(VerticalAlign.Top)
+                })
+              }
+              .width('100%')
+            }
+            .width('100%')
+            .padding(12)
+            .backgroundColor(AppColors.CardBackground)
+            .borderRadius(8)
+          }
+        })
+      }
+      .width('100%')
+      .layoutWeight(1)
+      .padding({ left: 20, right: 20 })
+      .scrollBar(BarState.Off)
+
+      // 底部提示
+      Text('在 GitHub 发布页查看完整更新历史')
+        .fontSize(12)
+        .fontColor(AppColors.TextTertiary)
+        .padding(20)
+        .width('100%')
+        .textAlign(TextAlign.Center)
+    }
+    .width('90%')
+    .height('70%')
+    .backgroundColor(AppColors.Background)
+    .borderRadius(16)
+    .transition(TransitionEffect.OPACITY.animation({ duration: AppAnimation.Normal, curve: Curve.EaseOut })
+      .combine(TransitionEffect.scale({ x: 0.96, y: 0.96 }).animation({ duration: AppAnimation.Normal, curve: Curve.EaseOut })))
+  }
+}
+
+
+@Builder
+export function SettingsPageV2Builder() {
+  SettingsPageV2()
+}

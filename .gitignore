@@ -1,0 +1,96 @@
+# HarmonyOS / DevEco Studio
+.idea/
+*.iml
+build/
+.cxx/
+oh_modules/
+node_modules/
+.hvigor/
+/.codex-build/
+.local.properties
+local.properties
+.preview/
+entry/.preview/
+nativelib/.preview/
+.appanalyzer/
+.github/appmod/
+
+# Build profile (contains signing config)
+/build-profile.json5
+/.signing/
+nativelib/BuildProfile.ets
+nativelib/src/main/cpp/include/
+nativelib/src/main/cpp/rs_include/
+
+# Local secrets (network password, etc.)
+entry/src/main/ets/common/Secrets.ets
+
+# Local test and tooling caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.cache/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+Testing/
+coverage/
+
+# Dev key secret (contains activation salt)
+entry/src/main/ets/config/DevKeySecret.ets
+entry/src/main/ets/config/GitHubOAuthConfig.ets
+
+# Temp empty files
+Check
+More
+
+# Compiled files
+*.o
+*.so
+*.a
+!nativelib/src/main/cpp/libopus/arm64-v8a/libopus.a
+!nativelib/src/main/cpp/libopus/x86_64/libopus.a
+*.hap
+*.app
+
+# Log files
+*.log
+
+# IDE
+.vscode/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+nul
+
+# Package lock files
+oh-package-lock.json5
+nativelib/src/main/cpp/mbedtls/
+
+# Scripts (local dev tools)
+scripts/*
+!scripts/gen-changelog.js
+!scripts/release.js
+!scripts/sunshine-mock-connection-test.js
+!scripts/archive-native-symbols.js
+!scripts/check-repository.js
+!scripts/check-open-source-licenses.js
+!scripts/test-display-frame-rate.cjs
+
+# Local release artifacts
+release-symbols/
+
+# Standalone SDK checkout used by CI/local native builds.
+/audio-haptics-sdk/
+
+# Trae 项目级技能目录（本地配置，不进库）
+.trae/
+
+# GitHub Actions workflow（token 缺 workflow 权限时临时排除）
+.github/workflows/
+
+# 本地依赖：easytier-ohrs har（第三方二进制，8.5MB，不进库；换机用拼装脚本复原）
+libs/

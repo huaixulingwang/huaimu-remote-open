@@ -1,0 +1,2033 @@
+/*
+ * Moonlight for HarmonyOS
+ * Copyright (C) 2024-2025 Moonlight/AlkaidLab
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ */
+
+/**
+ * 串流游戏菜单弹窗 - 奶油风格 + 透明玻璃效果
+ */
+import { display, promptAction } from '@kit.ArkUI';
+import { deviceInfo } from '@kit.BasicServicesKit';
+import { LengthMetrics, ColorMetrics } from '@kit.ArkUI';
+import { StreamViewModel } from '../../viewmodel/StreamViewModel';
+import { VirtualKey, sendShortcutKeys } from '../../service/customkey/CustomKeyTypes';
+import { CustomKeyStore } from '../../service/customkey/CustomKeyStore';
+import { ShortcutManager, Shortcut } from '../ShortcutManager';
+import { ActionDialog, ActionDialogConfig, ConfirmDialog, ConfirmDialogConfig } from './ConfirmDialog';
+import { SuperCmd } from '../../service/streaming/NvHttp';
+import {
+  GyroAssistService,
+  GYRO_ACTIVATION_ALWAYS,
+  GYRO_ACTIVATION_LT,
+  GYRO_ACTIVATION_RT,
+  GYRO_SENSITIVITY_MIN,
+  GYRO_SENSITIVITY_MAX
+} from '../../service/input/GyroAssistService';
+import { SettingsKeys } from '../../service/SettingsService';
+import { PreferencesUtil } from '../../utils/PreferencesUtil';
+import { DeviceSensorService } from '../../service/input/DeviceSensorService';
+import { ToastQueue } from '../../utils/ToastQueue';
+import {
+  StreamMenuColors,
+  OV_FONT_XS, OV_FONT_SM, OV_FONT_MD, OV_FONT_LG,
+  OV_CARD_WIDTH, OV_CARD_RADIUS, OV_CARD_BLUR,
+} from '../../common/OverlayConstants';
+import { Logger } from '../../common/Logger';
+
+/** 菜单回调接口 */
+export interface GameMenuCallbacks {
+  onDismiss: () => void;
+  onDisconnect: () => void;
+  onQuitGame: () => void;
+  onTouchModeChanged: (mode: string) => void;
+  onOpenShortcutEditor?: () => void;
+  onEditShortcut?: (shortcut: Shortcut) => void;
+  onDeleteShortcut?: (shortcut: Shortcut) => void;
+  onSendSuperCmd?: (cmdId: string) => void;
+  onForceUsbDriver?: () => void;
+  onToggleKeyboard?: () => void;
+  onToggleMouseEmulation?: () => void;
+  onControllerOpacityChange?: (opacity: number) => void;
+  onControllerScaleChange?: (scale: number) => void;
+  onTouchPassthroughChange?: (enabled: boolean) => void;
+  onClose?: () => void;
+  onUnlockOverlay?: () => void;
+  onToggleWindowMode?: () => void;
+  onToggleCustomKeys?: () => void;
+  onEditCustomKeys?: () => void;
+  onExportCustomKeys?: () => void;
+  onImportCustomKeys?: () => void;
+  onTogglePanZoom?: () => void;
+  onResetPanZoom?: () => void;
+  onSwitchCustomKeyProfile?: (name: string) => void;
+  /** 切换隐私屏（调用方负责弹确认并以重连方式生效） */
+  onTogglePrivacy?: () => void;
+}
+
+/** 菜单项配置 */
+interface MenuItem {
+  icon: string;
+  label: string;
+  bgColor: string;
+  borderColor: string;
+  textColor: string;
+}
+
+/** 触摸模式选项 */
+interface TouchModeOption {
+  key: string;
+  text: string;
+  subtitle: string;
+}
+
+/** 动作项配置 */
+interface ActionItem {
+  text: string;
+  subtitle: string;
+  color?: string;
+  backgroundColor?: string;
+  onClick: () => void;
+}
+
+// 常量定义
+const BUTTON_CARD_SIZE = 70;
+const ANIMATION_STAGGER_DELAY = 50;
+const ANIMATION_DURATION_IN = 200;
+const ANIMATION_DURATION_OUT = 200;
+const BITRATE_DEBOUNCE_MS = 500;
+const MENU_ITEM_COUNT = 7;
+
+// 卡片 ID（用于使用频率排序）
+const CARD_SHORTCUT = 'shortcut';
+const CARD_SUPERCMD = 'supercmd';
+const CARD_BITRATE = 'bitrate';
+const CARD_CUSTOMKEY = 'customkey';
+const CARD_AUDIO_VIBRATION = 'audio_vibration';
+const CARD_UNLOCK = 'unlock';
+const CARD_MIC = 'mic';
+const CARD_USAGE_KEY = 'game_menu_card_usage';
+
+// 马卡龙色系菜单配置
+const MENU_ITEMS: MenuItem[] = [
+  { icon: '✦', label: 'HDR', bgColor: '#F7EBC7', borderColor: '#D0A850', textColor: '#7B632F' },
+  { icon: '◎', label: 'USB驱动', bgColor: '#F7D1D1', borderColor: '#D87070', textColor: '#8A4848' },
+  { icon: '⌨', label: '键盘', bgColor: '#C7F7E0', borderColor: '#50C080', textColor: '#30734D' },
+  { icon: '☝', label: '触控', bgColor: '#E0D4F7', borderColor: '#9080C0', textColor: '#5F547F' },
+  { icon: '🎮', label: '手柄', bgColor: '#D4E8F7', borderColor: '#6098C0', textColor: '#406681' },
+  { icon: '🖱', label: '鼠标', bgColor: '#F7E0C7', borderColor: '#C08050', textColor: '#835736' },
+  { icon: '✕', label: '退出', bgColor: '#F7CFCF', borderColor: '#D06060', textColor: '#904242' }
+];
+
+const MENU_OFFSETS: number[] = [25, 55, 70, 35, 45, 30, 50];
+
+// 激活色
+const ACTIVE_BG_COLOR = '#C7F7D4';
+const ACTIVE_BORDER_COLOR = '#50A860';
+const ACTIVE_TEXT_COLOR = '#367241';
+
+@CustomDialog
+export struct GameMenuDialog {
+  controller: CustomDialogController;
+  viewModel: StreamViewModel = new StreamViewModel();
+  callbacks: GameMenuCallbacks = {
+    onDismiss: () => {},
+    onDisconnect: () => {},
+    onQuitGame: () => {},
+    onTouchModeChanged: () => {}
+  };
+  superCmds: SuperCmd[] = [];
+  isUsbDriverMode: boolean = false;
+  hasUsbGamepad: boolean = false;
+  isMouseEmulationActive: boolean = false;
+  hasConnectedGamepad: boolean = false;
+  isFullscreen: boolean = true;
+  controllerOpacity: number = 0.75;
+  controllerScale: number = 1.0;
+  touchPassthrough: boolean = false;
+  showCustomKeys: boolean = false;
+  isPanZoomActive: boolean = false;
+  /** 当前隐私屏是否开启（用于菜单文案） */
+  privacyScreenEnabled: boolean = false;
+
+  // 动画状态
+  @State private positions: number[] = Array(MENU_ITEM_COUNT).fill(200);
+  @State private scales: number[] = Array(MENU_ITEM_COUNT).fill(1.0);
+
+  // 快捷键
+  @State private shortcuts: Shortcut[] = [];
+  @State private dragFromIndex: number = -1;
+  @State private dragOverIndex: number = -1;
+  @State private isEditMode: boolean = false;
+
+  // 更多卡片折叠
+  @State private showMoreCards: boolean = false;
+  private shortcutManager = ShortcutManager.getInstance();
+
+  // 码率调整状态
+  @State private currentBitrate: number = 0;
+  @State private bitrateSliderValue: number = 0;
+  @State private isAdjustingBitrate: boolean = false;
+  @State private abrEnabled: boolean = false;
+  private bitrateDebounceTimer: number = -1;
+  /** 入场交错动画定时器，aboutToDisappear 时清理，避免销毁后触发 getUIContext */
+  private animateInTimers: number[] = [];
+
+  // 音频振动会话设置
+  @State private audioVibrationEnabled: boolean = false;
+  @State private audioVibrationStrength: number = 60;
+  @State private audioVibrationSceneMode: string = '游戏/电影';
+
+  // 体感助手状态
+  @State private gyroEnabled: boolean = false;
+  @State private gyroSensitivity: number = 1.0;
+  @State private gyroInvertX: boolean = false;
+  @State private gyroInvertY: boolean = false;
+  @State private gyroActivationKey: number = GYRO_ACTIVATION_ALWAYS;
+  private hasGyroscope: boolean = false;
+
+  // 关闭动画状态
+  private isClosing: boolean = false;
+
+  // 布局判断：屏幕 2/3 宽度能否放下两列卡片
+  @State private useTwoColumns: boolean = true;
+  // 卡片使用频率排序
+  @State private sortedMainCards: string[] = [];
+  private cardUsageCounts: Map<string, number> = new Map();
+  @State private micActive: boolean = false;
+  // 自定义按键配置档案
+  @State private customKeyProfileNames: string[] = [];
+  @State private customKeyActiveProfile: string = '';
+
+  // 虚拟手柄设置本地状态（拖动 Slider 时实时回调）
+  @State private controllerOpacityLocal: number = 0.75;
+  @State private controllerScaleLocal: number = 1.0;
+  @State private touchPassthroughLocal: boolean = false;
+
+  // 弹窗控制器
+  private exitDialogController?: CustomDialogController;
+  private touchModeDialogController?: CustomDialogController;
+  private usbDriverDialogController?: CustomDialogController;
+
+  // 通用卡片样式
+  @Styles cardStyle() {
+    .backgroundColor(StreamMenuColors.Surface)
+    .backdropBlur(OV_CARD_BLUR)
+    .borderRadius(OV_CARD_RADIUS)
+    .border({ width: 1, color: StreamMenuColors.Border })
+    .shadow({ radius: 12, color: StreamMenuColors.Shadow, offsetY: 3 })
+  }
+
+  aboutToDisappear(): void {
+    if (this.bitrateDebounceTimer !== -1) {
+      clearTimeout(this.bitrateDebounceTimer);
+      this.bitrateDebounceTimer = -1;
+    }
+    for (const t of this.animateInTimers) {
+      clearTimeout(t);
+    }
+    this.animateInTimers = [];
+  }
+
+  aboutToAppear(): void {
+    this.shortcuts = this.shortcutManager.getShortcuts();
+    this.currentBitrate = this.viewModel.getCurrentBitrate();
+    this.bitrateSliderValue = this.bitrateToSliderValue(this.currentBitrate);
+    this.abrEnabled = this.viewModel.isAbrEnabled();
+    const streamConfig = this.viewModel.streamConfig;
+    if (streamConfig) {
+      this.audioVibrationEnabled = streamConfig.enableAudioVibration;
+      this.audioVibrationStrength = Math.max(
+        10, Math.min(100, streamConfig.audioVibrationStrength));
+      // ABI v1 的 AUTO 当前按 GAME 处理，菜单只展示两个实际不同的场景。
+      this.audioVibrationSceneMode =
+        streamConfig.audioVibrationSceneMode === '音乐/节奏'
+          ? '音乐/节奏'
+          : '游戏/电影';
+    }
+    this.controllerOpacityLocal = this.controllerOpacity;
+    this.controllerScaleLocal = this.controllerScale;
+    this.touchPassthroughLocal = this.touchPassthrough;
+    this.loadGyroSettings();
+    this.loadCardUsageCounts();
+    this.loadCustomKeyProfiles();
+    this.micActive = this.viewModel.getSession()?.isMicrophoneActive() ?? false;
+    this.detectLayoutMode();
+    this.animateIn();
+  }
+
+  /**
+   * 根据屏幕宽度的 2/3 是否能容纳两列卡片来决定布局
+   * 两列所需宽度 = OV_CARD_WIDTH * 2 + 间距 + 内边距
+   */
+  private detectLayoutMode(): void {
+    try {
+      const displayInfo = display.getDefaultDisplaySync();
+      const vpWidth = displayInfo.width / displayInfo.densityPixels;
+      const twoColumnMinWidth = (OV_CARD_WIDTH * 2 + 12 + 32); // 两列卡片 + 间距 + 左右内边距
+      this.useTwoColumns = (vpWidth * 2 / 3) >= twoColumnMinWidth;
+    } catch (_) {}
+  }
+
+  private shortcutSurfaceColor(color: string): string {
+    return '#20' + color.replace('#', '');
+  }
+
+  private shortcutBorderColor(color: string): string {
+    return '#80' + color.replace('#', '');
+  }
+
+  private animateIn(): void {
+    for (let i = 0; i < MENU_ITEM_COUNT; i++) {
+      this.animateInTimers.push(setTimeout(() => {
+        this.getUIContext().animateTo({
+          duration: ANIMATION_DURATION_IN,
+          curve: Curve.FastOutSlowIn,
+        }, () => {
+          this.positions[i] = 0;
+        });
+      }, i * ANIMATION_STAGGER_DELAY));
+    }
+  }
+
+  private animateOut(): void {
+    if (this.isClosing) return;
+    this.isClosing = true;
+
+    const callbacks = this.callbacks;
+
+    this.getUIContext().animateTo({
+      duration: ANIMATION_DURATION_OUT,
+      curve: Curve.FastOutLinearIn
+    }, () => {
+      for (let i = 0; i < MENU_ITEM_COUNT; i++) {
+        this.positions[i] = 200;
+      }
+    });
+
+    setTimeout(() => {
+      callbacks.onClose?.();
+      callbacks.onDismiss();
+    }, ANIMATION_DURATION_OUT + 50);
+  }
+
+  private sendKeys(keys: number[]): void {
+    this.viewModel.getSession()?.sendKeys(keys);
+  }
+
+  private sendShortcut(shortcut: Shortcut): void {
+    const session = this.viewModel.getSession();
+    if (session) {
+      sendShortcutKeys((keys: number[]) => session.sendKeys(keys), shortcut.keys, shortcut.keySequence);
+    }
+  }
+
+  private showAddShortcutMenu(): void {
+    const deletedBuiltins = this.shortcutManager.getDeletedBuiltinShortcuts();
+    if (deletedBuiltins.length === 0) {
+      this.callbacks.onOpenShortcutEditor?.();
+      return;
+    }
+    const buttons: promptAction.Button[] = [
+      { text: '新建快捷键', color: '#10B981' },
+      { text: '恢复预置快捷键', color: '#5BA3D0' },
+      { text: '取消', color: '#6B7280' }
+    ];
+    promptAction.showDialog({
+      title: '添加快捷键',
+      message: `有 ${deletedBuiltins.length} 个预置快捷键可恢复`,
+      buttons: buttons
+    }).then((result) => {
+      if (result.index === 0) {
+        this.callbacks.onOpenShortcutEditor?.();
+      } else if (result.index === 1) {
+        this.showRestoreBuiltinMenu(deletedBuiltins);
+      }
+    });
+  }
+
+  private showRestoreBuiltinMenu(deletedBuiltins: Shortcut[]): void {
+    const buttons: promptAction.Button[] = deletedBuiltins.map(s => {
+      const btn: promptAction.Button = { text: `${s.icon || ''} ${s.name}`, color: s.color || '#5BA3D0' };
+      return btn;
+    });
+    buttons.push({ text: '全部恢复', color: '#10B981' });
+    buttons.push({ text: '取消', color: '#6B7280' });
+    promptAction.showDialog({
+      title: '恢复预置快捷键',
+      message: '选择要恢复的快捷键',
+      buttons: buttons
+    }).then(async (result) => {
+      if (result.index < deletedBuiltins.length) {
+        await this.shortcutManager.restoreBuiltinShortcut(deletedBuiltins[result.index].id);
+        this.shortcuts = this.shortcutManager.getShortcuts();
+      } else if (result.index === deletedBuiltins.length) {
+        // 全部恢复
+        for (const s of deletedBuiltins) {
+          await this.shortcutManager.restoreBuiltinShortcut(s.id);
+        }
+        this.shortcuts = this.shortcutManager.getShortcuts();
+      }
+    });
+  }
+
+  // 码率辅助方法
+  private bitrateToSliderValue(bitrate: number): number {
+    return Math.max(0, Math.min(1995, Math.round((bitrate - 500) / 100)));
+  }
+
+  private sliderValueToBitrate(value: number): number {
+    return value * 100 + 500;
+  }
+
+  private formatBitrate(kbps: number): string {
+    return kbps >= 1000 ? `${(kbps / 1000).toFixed(0)} Mbps` : `${kbps} kbps`;
+  }
+
+  private applyBitrateChange(): void {
+    if (this.bitrateDebounceTimer !== -1) {
+      clearTimeout(this.bitrateDebounceTimer);
+    }
+    this.recordCardUsage(CARD_BITRATE);
+
+    this.bitrateDebounceTimer = setTimeout(async () => {
+      const newBitrate = this.sliderValueToBitrate(this.bitrateSliderValue);
+      this.isAdjustingBitrate = true;
+
+      try {
+        const success = await this.viewModel.setBitrate(newBitrate);
+        if (success) {
+          this.currentBitrate = newBitrate;
+          ToastQueue.show({ message: `码率已调整为 ${this.formatBitrate(newBitrate)}`, duration: 2000 });
+        } else {
+          this.bitrateSliderValue = this.bitrateToSliderValue(this.currentBitrate);
+          ToastQueue.show({ message: '码率调整失败', duration: 2000 });
+        }
+      } catch (err) {
+        this.bitrateSliderValue = this.bitrateToSliderValue(this.currentBitrate);
+        ToastQueue.show({ message: `码率调整失败: ${(err as Error).message}`, duration: 2000 });
+      } finally {
+        this.isAdjustingBitrate = false;
+        this.bitrateDebounceTimer = -1;
+      }
+    }, BITRATE_DEBOUNCE_MS);
+  }
+
+  private showExitDialog(): void {
+    const callbacks = this.callbacks;
+    const actions: ActionItem[] = [];
+
+    // 窗口/全屏切换 - 仅在 2in1 设备（支持自由窗口模式）上显示
+    if (deviceInfo.deviceType === '2in1') {
+      actions.push({
+        text: this.isFullscreen ? '窗口模式' : '全屏模式',
+        subtitle: this.isFullscreen ? '切换到悬浮窗口，方便多任务' : '切换到沉浸式全屏',
+        color: '#8B5CF6',
+        backgroundColor: '#F5F3FF',
+        onClick: () => {
+          callbacks.onToggleWindowMode?.();
+          callbacks.onClose?.();
+        }
+      });
+    }
+
+    actions.push(
+      {
+        text: this.privacyScreenEnabled ? '关闭隐私屏' : '开启隐私屏',
+        subtitle: this.privacyScreenEnabled
+          ? '恢复电脑屏幕显示，需重新连接'
+          : '让电脑屏幕变黑，需重新连接',
+        color: '#059669',
+        backgroundColor: '#ECFDF5',
+        onClick: () => {
+          callbacks.onTogglePrivacy?.();
+          callbacks.onClose?.();
+        }
+      },
+      {
+        text: '断开连接',
+        subtitle: '游戏继续在主机上运行',
+        color: '#3B82F6',
+        backgroundColor: '#EFF6FF',
+        onClick: () => {
+          callbacks.onDisconnect();
+          callbacks.onClose?.();
+        }
+      },
+      {
+        text: '退出游戏',
+        subtitle: '关闭主机上的游戏',
+        color: '#EF4444',
+        backgroundColor: '#FEF2F2',
+        onClick: () => {
+          callbacks.onQuitGame();
+          callbacks.onClose?.();
+        }
+      }
+    );
+    const config: ActionDialogConfig = {
+      title: '离开串流',
+      actions: actions,
+      cancelText: '继续游戏',
+      onCancel: () => {}
+    };
+
+    this.exitDialogController = new CustomDialogController({
+      builder: ActionDialog({ config }),
+      alignment: DialogAlignment.Center,
+      customStyle: true,
+      backgroundColor: Color.Transparent
+    });
+    this.exitDialogController.open();
+  }
+
+  /** 触摸模式简称（工具条上用，避免太长挤占空间） */
+  private getTouchModeShortName(): string {
+    switch (this.viewModel.touchMode) {
+      case 'trackpad':
+        return '触控板';
+      case 'direct':
+        return '多点触控';
+      case 'mouse':
+        return '触摸鼠标';
+      case 'ds5_touchpad':
+        return 'DS5';
+      default:
+        return '触控';
+    }
+  }
+
+  private showTouchModeDialog(): void {
+    const currentMode = this.viewModel.touchMode;
+    const modes: TouchModeOption[] = [
+      { key: 'trackpad', text: '触控板', subtitle: '像笔记本触控板一样操作' },
+      { key: 'direct', text: '多点触控', subtitle: '直接点击屏幕位置' },
+      { key: 'mouse', text: '触摸鼠标', subtitle: '模拟鼠标移动和点击' },
+      { key: 'ds5_touchpad', text: 'DS5 触控板', subtitle: '屏幕映射 DualSense 触控板，支持双指' }
+    ];
+
+    const actions: ActionItem[] = modes.map((mode: TouchModeOption): ActionItem => {
+      const item: ActionItem = {
+        text: mode.text,
+        subtitle: currentMode === mode.key ? '✓ 当前模式' : mode.subtitle,
+        color: currentMode === mode.key ? '#10B981' : undefined,
+        backgroundColor: currentMode === mode.key ? '#D1FAE5' : undefined,
+        onClick: () => this.callbacks.onTouchModeChanged(mode.key)
+      };
+      return item;
+    });
+
+    const config: ActionDialogConfig = {
+      title: '选择触摸模式',
+      actions: actions,
+      cancelText: '取消',
+      onCancel: () => {}
+    };
+
+    this.touchModeDialogController = new CustomDialogController({
+      builder: ActionDialog({ config }),
+      alignment: DialogAlignment.Center,
+      customStyle: true,
+      backgroundColor: Color.Transparent
+    });
+    this.touchModeDialogController.open();
+  }
+
+  private showUsbDriverDialog(): void {
+    const config: ConfirmDialogConfig = {
+      title: '强制 USB 驱动接管',
+      message: '放弃系统手柄接口 (GCK)，改由 USB 驱动直接处理手柄输入。\n\n仅在手柄输入异常或需要 USB 低延迟时使用。蓝牙手柄不受此选项影响。\n\n当前连接的 USB 手柄会短暂断开并重新连接。',
+      cancelButton: { text: '取消', onClick: () => {} },
+      confirmButton: {
+        text: '接管',
+        color: '#3B82F6',
+        onClick: () => {
+          this.callbacks.onForceUsbDriver?.();
+          this.animateOut();
+        }
+      }
+    };
+
+    this.usbDriverDialogController = new CustomDialogController({
+      builder: ConfirmDialog({ config }),
+      alignment: DialogAlignment.Center,
+      customStyle: true,
+      backgroundColor: Color.Transparent
+    });
+    this.usbDriverDialogController.open();
+  }
+
+  private handleMenuClick(index: number): void {
+    switch (index) {
+      case 0:
+        this.sendKeys([VirtualKey.VK_LWIN, VirtualKey.VK_MENU, VirtualKey.VK_B]);
+        this.animateOut();
+        break;
+      case 1:
+        if (this.isUsbDriverMode) {
+          ToastQueue.show({ message: '当前已是 USB 驱动模式', duration: 2000 });
+        } else {
+          this.showUsbDriverDialog();
+        }
+        break;
+      case 2:
+        this.callbacks.onToggleKeyboard?.();
+        this.animateOut();
+        break;
+      case 3:
+        this.showTouchModeDialog();
+        break;
+      case 4:
+        this.viewModel.toggleController();
+        this.animateOut();
+        break;
+      case 5:
+        this.callbacks.onToggleMouseEmulation?.();
+        this.animateOut();
+        break;
+      case 6:
+        this.showExitDialog();
+        break;
+    }
+  }
+
+  private getMenuLabel(index: number): string {
+    if (index === 1 && this.isUsbDriverMode) return 'USB驱动 ✓';
+    if (index === 5 && this.isMouseEmulationActive) return '鼠标 ✓';
+    return MENU_ITEMS[index].label;
+  }
+
+  private getMenuBgColor(index: number): string {
+    if ((index === 1 && this.isUsbDriverMode) || (index === 5 && this.isMouseEmulationActive)) {
+      return ACTIVE_BG_COLOR;
+    }
+    return MENU_ITEMS[index].bgColor;
+  }
+
+  private getMenuBorderColor(index: number): string {
+    if ((index === 1 && this.isUsbDriverMode) || (index === 5 && this.isMouseEmulationActive)) {
+      return ACTIVE_BORDER_COLOR;
+    }
+    return MENU_ITEMS[index].borderColor;
+  }
+
+  private getMenuTextColor(index: number): string {
+    if ((index === 1 && this.isUsbDriverMode) || (index === 5 && this.isMouseEmulationActive)) {
+      return ACTIVE_TEXT_COLOR;
+    }
+    return MENU_ITEMS[index].textColor;
+  }
+
+  private async loadGyroSettings(): Promise<void> {
+    this.hasGyroscope = DeviceSensorService.getInstance().hasGyroscope();
+    const gyroAssist = GyroAssistService.getInstance();
+    this.gyroEnabled = gyroAssist.enabled;
+    this.gyroSensitivity = gyroAssist.sensitivityMultiplier;
+    this.gyroInvertX = gyroAssist.invertX;
+    this.gyroInvertY = gyroAssist.invertY;
+    this.gyroActivationKey = gyroAssist.activationKey;
+  }
+
+  /**
+   * 加载卡片使用频率并构建排序列表
+   */
+  private async loadCardUsageCounts(): Promise<void> {
+    try {
+      const json = await PreferencesUtil.get<string>(CARD_USAGE_KEY, '{}');
+      const parsed = JSON.parse(json) as Record<string, number>;
+      const entries = Object.entries(parsed);
+      for (let i = 0; i < entries.length; i++) {
+        this.cardUsageCounts.set(entries[i][0], entries[i][1] as number);
+      }
+    } catch (_) {}
+    this.rebuildSortedCards();
+  }
+
+  /**
+   * 根据当前可见性和使用频率重建排序卡片列表
+   */
+  private rebuildSortedCards(): void {
+    const visible: string[] = [];
+    if (this.shortcuts.length > 0) visible.push(CARD_SHORTCUT);
+    if (this.superCmds.length > 0) visible.push(CARD_SUPERCMD);
+    visible.push(CARD_BITRATE);
+    visible.push(CARD_AUDIO_VIBRATION);
+    visible.push(CARD_CUSTOMKEY);
+    // 按使用次数降序排列，次数相同保持原始顺序
+    visible.sort((a: string, b: string): number => {
+      const ca = this.cardUsageCounts.get(a) || 0;
+      const cb = this.cardUsageCounts.get(b) || 0;
+      return cb - ca;
+    });
+    this.sortedMainCards = visible;
+  }
+
+  /** 是否有快捷按钮卡片（解锁、显示覆盖层、麦克风等 1x1 小按钮） */
+  private hasButtonCards(): boolean {
+    return this.viewModel.overlayState.config.isLocked ||
+      !this.viewModel.showOverlay ||
+      (this.viewModel.getSession()?.isMicrophoneEnabled() ?? false);
+  }
+
+  /**
+   * 记录卡片使用并持久化
+   */
+  private recordCardUsage(cardId: string): void {
+    const count = (this.cardUsageCounts.get(cardId) || 0) + 1;
+    this.cardUsageCounts.set(cardId, count);
+    // 异步持久化
+    const obj: Record<string, number> = {};
+    this.cardUsageCounts.forEach((v: number, k: string) => { obj[k] = v; });
+    PreferencesUtil.put(CARD_USAGE_KEY, JSON.stringify(obj)).catch(() => {});
+  }
+
+  private async loadCustomKeyProfiles(): Promise<void> {
+    try {
+      await CustomKeyStore.init();
+      this.customKeyProfileNames = await CustomKeyStore.getProfileNames();
+      this.customKeyActiveProfile = await CustomKeyStore.getActiveProfileName();
+    } catch (_) {}
+  }
+
+  private async saveGyroSetting(key: string, value: string | boolean | number): Promise<void> {
+    try {
+      await PreferencesUtil.put(key, value);
+    } catch (error) {
+      Logger.error('GameMenuDialog', '[GyroAssist] 保存设置失败:', error);
+    }
+  }
+
+  private applyAudioVibrationSettings(persist: boolean): void {
+    this.viewModel.updateAudioVibrationSettings(
+      this.audioVibrationEnabled,
+      this.audioVibrationStrength,
+      this.audioVibrationSceneMode
+    );
+    if (!persist) return;
+
+    PreferencesUtil.put(
+      SettingsKeys.ENABLE_AUDIO_VIBRATION,
+      this.audioVibrationEnabled
+    ).catch((error: Error) => {
+      Logger.error('GameMenuDialog', '[AudioVibration] 保存启用状态失败:', error);
+    });
+    PreferencesUtil.put(
+      SettingsKeys.AUDIO_VIBRATION_STRENGTH,
+      this.audioVibrationStrength
+    ).catch((error: Error) => {
+      Logger.error('GameMenuDialog', '[AudioVibration] 保存强度失败:', error);
+    });
+    PreferencesUtil.put(
+      SettingsKeys.AUDIO_VIBRATION_SCENE_MODE,
+      this.audioVibrationSceneMode
+    ).catch((error: Error) => {
+      Logger.error('GameMenuDialog', '[AudioVibration] 保存场景失败:', error);
+    });
+  }
+
+  build() {
+    Stack({ alignContent: Alignment.Center }) {
+      // 背景可点击关闭
+      Column()
+        .width('100%')
+        .height('100%')
+        .onClick(() => {
+          this.animateOut();
+        })
+
+      // 右侧菜单按钮
+      Column() {
+        this.SockButton(0)
+        if (this.hasUsbGamepad) this.SockButton(1)
+        this.SockButton(2)
+        this.SockButton(3)
+        if (this.viewModel.inputSettings?.enableOnscreenControls) this.SockButton(4)
+        if (this.hasConnectedGamepad) this.SockButton(5)
+        this.SockButton(6)
+      }
+      .alignItems(HorizontalAlign.End)
+      .justifyContent(FlexAlign.Center)
+      .padding({ top: 20, bottom: 20 })
+      .position({ x: '100%', y: '50%' })
+      .translate({ x: '-100%', y: '-50%' })
+
+      // 左侧面板
+      if (this.useTwoColumns) {
+        this.TwoColumnLayout()
+      } else {
+        this.SingleColumnLayout()
+      }
+    }
+    .width('100%')
+    .height('100%')
+    .backgroundColor(StreamMenuColors.Scrim)
+    .transition(TransitionEffect.OPACITY.animation({ duration: ANIMATION_DURATION_IN, curve: Curve.EaseOut })
+      .combine(TransitionEffect.scale({ x: 0.96, y: 0.96 }).animation({ duration: ANIMATION_DURATION_IN, curve: Curve.EaseOut })))
+  }
+
+  @Builder
+  TwoColumnLayout() {
+    Scroll() {
+      Row({ space: 12 }) {
+        Column({ space: 12 }) {
+          // 顶部常用动作条
+          this.QuickActionBar()
+          // 左列：排序后奇数位卡片（索引 0, 2, 4...）
+          ForEach(this.sortedMainCards.filter((_: string, i: number) => i % 2 === 0),
+            (cardId: string) => { this.RenderCardById(cardId) },
+            (cardId: string) => cardId)
+          // 快捷按钮行（解锁、麦克风等小卡片）
+          if (this.hasButtonCards()) {
+            this.ButtonCardsRow()
+          }
+          // "更多设置"折叠区（左列下方）
+          if (this.hasMoreCards()) {
+            this.MoreCardsToggle()
+            if (this.showMoreCards) {
+              if (this.viewModel.inputSettings?.enableOnscreenControls) this.VirtualControllerCard()
+              if (this.hasGyroscope) this.GyroAssistCard()
+            }
+          }
+        }
+        .alignItems(HorizontalAlign.Start)
+
+        Column({ space: 12 }) {
+          // 右列：排序后偶数位卡片（索引 1, 3, 5...）
+          ForEach(this.sortedMainCards.filter((_: string, i: number) => i % 2 === 1),
+            (cardId: string) => { this.RenderCardById(cardId) },
+            (cardId: string) => cardId)
+        }
+        .alignItems(HorizontalAlign.Start)
+      }
+      .alignItems(VerticalAlign.Top)
+    }
+    .scrollBar(BarState.Off)
+    .scrollable(ScrollDirection.Vertical)
+    .edgeEffect(EdgeEffect.Spring)
+    .padding({ top: 20, bottom: 20, left: 16, right: 16 })
+    .constraintSize({ maxHeight: '85%' })
+    .position({ x: 16, y: '50%' })
+    .translate({ y: '-50%' })
+  }
+
+  @Builder
+  SingleColumnLayout() {
+    Scroll() {
+      Column({ space: 12 }) {
+        // 顶部常用动作条
+        this.QuickActionBar()
+        // 按使用频率排列的主卡片
+        ForEach(this.sortedMainCards,
+          (cardId: string) => { this.RenderCardById(cardId) },
+          (cardId: string) => cardId)
+        // 快捷按钮行（解锁、麦克风等小卡片）
+        if (this.hasButtonCards()) {
+          this.ButtonCardsRow()
+        }
+        // "更多设置"折叠区
+        if (this.hasMoreCards()) {
+          this.MoreCardsToggle()
+          if (this.showMoreCards) {
+            if (this.viewModel.inputSettings?.enableOnscreenControls) this.VirtualControllerCard()
+            if (this.hasGyroscope) this.GyroAssistCard()
+          }
+        }
+      }
+      .alignItems(HorizontalAlign.Start)
+    }
+    .scrollBar(BarState.Off)
+    .scrollable(ScrollDirection.Vertical)
+    .edgeEffect(EdgeEffect.Spring)
+    .padding({ top: 20, bottom: 20, left: 16, right: 16 })
+    .constraintSize({ maxHeight: '85%' })
+    .position({ x: 16, y: '50%' })
+    .translate({ y: '-50%' })
+  }
+
+  /**
+   * 抽屉顶部工具条上的单个胶囊按钮。
+   * active 为 true 时用强调色边框，表示该功能当前已开启。
+   */
+  @Builder
+  QuickPill(label: string, active: boolean, action: () => void) {
+    Text(label)
+      .fontSize(OV_FONT_MD)
+      .fontWeight(active ? FontWeight.Bold : FontWeight.Medium)
+      .fontColor(active ? StreamMenuColors.TextBright : StreamMenuColors.TextMedium)
+      .maxLines(1)
+      .height(32)
+      .padding({ left: 14, right: 14 })
+      .borderRadius(16)
+      .backgroundColor(active ? StreamMenuColors.SelectedSurface : StreamMenuColors.Control)
+      .border({ width: 1, color: active ? StreamMenuColors.AccentBlue : StreamMenuColors.Border })
+      .onClick(action)
+  }
+
+  /**
+   * 抽屉顶部的常用动作条：触控模式、隐私屏、离开串流。
+   * 这三项用得最多，不再需要到右侧停靠栏里逐个翻。
+   */
+  @Builder
+  QuickActionBar() {
+    Row({ space: 8 }) {
+      this.QuickPill(`👆 ${this.getTouchModeShortName()}`, false, () => this.showTouchModeDialog())
+      this.QuickPill(
+        this.privacyScreenEnabled ? '🔒 隐私屏 开' : '🔒 隐私屏 关',
+        this.privacyScreenEnabled,
+        () => {
+          this.callbacks.onTogglePrivacy?.();
+          this.callbacks.onClose?.();
+        })
+      Blank()
+      this.QuickPill('⏻ 离开', false, () => this.showExitDialog())
+    }
+    .width(OV_CARD_WIDTH)
+  }
+
+  @Builder
+  RenderCardById(cardId: string) {
+    if (cardId === CARD_SHORTCUT) {
+      this.ShortcutCard()
+    } else if (cardId === CARD_SUPERCMD) {
+      this.SuperCmdCard()
+    } else if (cardId === CARD_BITRATE) {
+      this.BitrateCard()
+    } else if (cardId === CARD_CUSTOMKEY) {
+      this.CustomKeyCard()
+    } else if (cardId === CARD_AUDIO_VIBRATION) {
+      this.AudioVibrationCard()
+    }
+  }
+
+  @Builder
+  @Builder
+  ButtonCardsRow() {
+    Row({ space: 8 }) {
+      if (this.viewModel.overlayState.config.isLocked) {
+        this.UnlockOverlayCard()
+      } else if (!this.viewModel.showOverlay) {
+        this.ShowOverlayCard()
+      }
+      if (this.viewModel.getSession()?.isMicrophoneEnabled()) {
+        this.MicCard()
+      }
+    }
+  }
+
+  @Builder
+  UnlockOverlayCard() {
+    Column() {
+      Image($r('app.media.ic_lock_open'))
+        .width(22)
+        .height(22)
+        .fillColor(StreamMenuColors.TextBright)
+      Text('解锁')
+        .fontSize(OV_FONT_MD)
+        .fontWeight(FontWeight.Medium)
+        .fontColor(StreamMenuColors.TextBright)
+        .margin({ top: 4 })
+    }
+    .width(BUTTON_CARD_SIZE)
+    .height(BUTTON_CARD_SIZE)
+    .justifyContent(FlexAlign.Center)
+    .cardStyle()
+    .onClick(() => {
+      this.recordCardUsage(CARD_UNLOCK);
+      this.callbacks.onUnlockOverlay?.();
+      this.callbacks.onClose?.();
+    })
+  }
+
+  @Builder
+  ShowOverlayCard() {
+    Column() {
+      Image($r('app.media.ic_pulse'))
+        .width(22)
+        .height(22)
+        .fillColor(StreamMenuColors.TextBright)
+      Text('监控')
+        .fontSize(OV_FONT_MD)
+        .fontWeight(FontWeight.Medium)
+        .fontColor(StreamMenuColors.TextBright)
+        .margin({ top: 4 })
+    }
+    .width(BUTTON_CARD_SIZE)
+    .height(BUTTON_CARD_SIZE)
+    .justifyContent(FlexAlign.Center)
+    .cardStyle()
+    .onClick(() => {
+      this.viewModel.toggleOverlay();
+      this.callbacks.onClose?.();
+    })
+  }
+
+  @Builder
+  MicCard() {
+    Column() {
+      Image(this.micActive ? $r('app.media.ic_microphone') : $r('app.media.ic_microphone_slash'))
+        .width(22)
+        .height(22)
+        .fillColor(this.micActive ? StreamMenuColors.TextBright : StreamMenuColors.TextDim)
+      Text(this.micActive ? '麦克风' : '已静音')
+        .fontSize(OV_FONT_MD)
+        .fontWeight(FontWeight.Medium)
+        .fontColor(this.micActive ? StreamMenuColors.TextBright : StreamMenuColors.TextDim)
+        .margin({ top: 4 })
+    }
+    .width(BUTTON_CARD_SIZE)
+    .height(BUTTON_CARD_SIZE)
+    .justifyContent(FlexAlign.Center)
+    .cardStyle()
+    .onClick(() => {
+      this.recordCardUsage(CARD_MIC);
+      const session = this.viewModel.getSession();
+      if (!session?.hasMicrophoneStream()) {
+        ToastQueue.show({ message: '主机未请求麦克风', duration: 1500 });
+        return;
+      }
+      session.toggleMicrophone().then((active: boolean) => {
+        this.micActive = active;
+        ToastQueue.show({
+          message: active ? '麦克风已开启' : '麦克风已关闭',
+          duration: 1500
+        });
+      });
+    })
+  }
+
+  /** 是否有可折叠的低频卡片 */
+  private hasMoreCards(): boolean {
+    return !!(this.viewModel.inputSettings?.enableOnscreenControls) || this.hasGyroscope;
+  }
+
+  @Builder
+  MoreCardsToggle() {
+    Row() {
+      Text(this.showMoreCards ? '▾' : '▸')
+        .fontSize(12)
+        .fontColor(StreamMenuColors.TextDim)
+        .margin({ right: 6 })
+      Text('更多设置')
+        .fontSize(OV_FONT_MD)
+        .fontColor(StreamMenuColors.TextDim)
+      Text(` · 虚拟手柄${this.hasGyroscope ? '、体感助手' : ''}`)
+        .fontSize(OV_FONT_SM)
+        .fontColor(StreamMenuColors.TextFaint)
+    }
+    .width(OV_CARD_WIDTH)
+    .height(36)
+    .padding({ left: 14, right: 14 })
+    .cardStyle()
+    .alignItems(VerticalAlign.Center)
+    .onClick(() => {
+      this.getUIContext().animateTo({ duration: 200, curve: Curve.EaseInOut }, () => {
+        this.showMoreCards = !this.showMoreCards;
+      });
+    })
+  }
+
+  @Builder
+  CustomKeyCard() {
+    Column() {
+      Row() {
+        Image($r('app.media.ic_crown'))
+          .width(14).height(14).fillColor(StreamMenuColors.AccentGold)
+        Text(' 自定义按键')
+          .fontSize(OV_FONT_LG)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(StreamMenuColors.TextBright)
+        Blank()
+        Toggle({ type: ToggleType.Switch, isOn: this.showCustomKeys })
+          .selectedColor(StreamMenuColors.AccentPink)
+          .switchPointColor(StreamMenuColors.OnAccent)
+          .width(40)
+          .height(22)
+          .onChange((isOn: boolean) => {
+            if (isOn !== this.showCustomKeys) {
+              this.showCustomKeys = isOn;
+              this.recordCardUsage(CARD_CUSTOMKEY);
+              this.callbacks.onToggleCustomKeys?.();
+            }
+          })
+      }
+      .width('100%')
+      .padding({ left: 16, right: 12, top: 14, bottom: 4 })
+
+      Text('自由放置的屏幕虚拟按键')
+        .fontSize(OV_FONT_SM)
+        .fontColor(StreamMenuColors.TextFaint)
+        .width('100%')
+        .padding({ left: 16, right: 16, bottom: 6 })
+
+      // 配置档案选择器
+      if (this.customKeyProfileNames.length > 1) {
+        Scroll() {
+          Row({ space: 6 }) {
+            ForEach(this.customKeyProfileNames, (name: string) => {
+              Text(name)
+                .fontSize(11)
+                .fontWeight(name === this.customKeyActiveProfile ? FontWeight.Bold : FontWeight.Medium)
+                .fontColor(name === this.customKeyActiveProfile ? StreamMenuColors.OnAccent : StreamMenuColors.TextMedium)
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+                .padding({ left: 10, right: 10, top: 4, bottom: 4 })
+                .borderRadius(12)
+                .backgroundColor(name === this.customKeyActiveProfile ? StreamMenuColors.AccentBlue : StreamMenuColors.Control)
+                .border({ width: 1, color: name === this.customKeyActiveProfile ? StreamMenuColors.BlueBorder : StreamMenuColors.Border })
+                .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.95 })
+                .onClick(() => {
+                  if (name !== this.customKeyActiveProfile) {
+                    this.customKeyActiveProfile = name;
+                    this.callbacks.onSwitchCustomKeyProfile?.(name);
+                  }
+                })
+            }, (name: string) => name)
+          }
+          .padding({ left: 16, right: 16 })
+        }
+        .scrollable(ScrollDirection.Horizontal)
+        .scrollBar(BarState.Off)
+        .width('100%')
+        .padding({ bottom: 8 })
+      }
+
+      Row({ space: 8 }) {
+        Text('编辑布局')
+          .fontSize(12)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(StreamMenuColors.AccentPinkText)
+          .padding({ left: 14, right: 14, top: 7, bottom: 7 })
+          .borderRadius(14)
+          .backgroundColor(StreamMenuColors.PinkSurface)
+          .border({ width: 1, color: StreamMenuColors.PinkBorder })
+          .onClick(() => {
+            this.callbacks.onEditCustomKeys?.();
+            this.animateOut();
+          })
+        Text('导出')
+          .fontSize(12)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(StreamMenuColors.AccentBlueText)
+          .padding({ left: 14, right: 14, top: 7, bottom: 7 })
+          .borderRadius(14)
+          .backgroundColor(StreamMenuColors.BlueSurface)
+          .border({ width: 1, color: StreamMenuColors.BlueBorder })
+          .onClick(() => {
+            this.callbacks.onExportCustomKeys?.();
+            this.animateOut();
+          })
+        Text('导入')
+          .fontSize(12)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(StreamMenuColors.AccentBlueText)
+          .padding({ left: 14, right: 14, top: 7, bottom: 7 })
+          .borderRadius(14)
+          .backgroundColor(StreamMenuColors.BlueSurface)
+          .border({ width: 1, color: StreamMenuColors.BlueBorder })
+          .onClick(() => {
+            this.callbacks.onImportCustomKeys?.();
+            this.animateOut();
+          })
+      }
+      .width('100%')
+      .justifyContent(FlexAlign.Center)
+      .padding({ bottom: 10 })
+
+      // ── 画面缩放（合并在自定义按键卡片内） ──
+      Row().width('85%').height(1).backgroundColor(StreamMenuColors.Divider)
+
+      Row() {
+        Image($r('app.media.ic_magnifying_glass')).width(OV_FONT_LG).height(OV_FONT_LG).fillColor(StreamMenuColors.TextBright)
+        Text(' 画面缩放')
+          .fontSize(OV_FONT_MD)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(StreamMenuColors.TextMedium)
+        Blank()
+        if (this.isPanZoomActive) {
+          Text('重置')
+            .fontSize(11)
+            .fontColor(StreamMenuColors.AccentBlueText)
+            .fontWeight(FontWeight.Medium)
+            .padding({ left: 10, right: 10, top: 4, bottom: 4 })
+            .borderRadius(10)
+            .backgroundColor(StreamMenuColors.BlueSurface)
+            .border({ width: 1, color: StreamMenuColors.BlueBorder })
+            .margin({ right: 8 })
+            .onClick(() => {
+              this.callbacks.onResetPanZoom?.();
+            })
+        }
+        Toggle({ type: ToggleType.Switch, isOn: this.isPanZoomActive })
+          .selectedColor(StreamMenuColors.AccentBlue)
+          .switchPointColor(StreamMenuColors.OnAccent)
+          .width(40)
+          .height(22)
+          .onChange((isOn: boolean) => {
+            if (isOn !== this.isPanZoomActive) {
+              this.isPanZoomActive = isOn;
+              this.callbacks.onTogglePanZoom?.();
+              this.animateOut();
+            }
+          })
+      }
+      .width('100%')
+      .padding({ left: 16, right: 12, top: 10, bottom: 4 })
+
+      Text('双指缩放操控画面，最大 10x')
+        .fontSize(OV_FONT_SM)
+        .fontColor(StreamMenuColors.TextFaint)
+        .width('100%')
+        .padding({ left: 16, right: 16, bottom: 14 })
+    }
+    .width(OV_CARD_WIDTH)
+    .cardStyle()
+  }
+
+  @Builder
+  VirtualControllerCard() {
+    Column() {
+      Row() {
+        Image($r('app.media.ic_game_controller')).width(OV_FONT_LG).height(OV_FONT_LG).fillColor(StreamMenuColors.TextBright)
+        Text(' 虚拟手柄')
+          .fontSize(OV_FONT_LG)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(StreamMenuColors.TextBright)
+        Blank()
+        Toggle({ type: ToggleType.Switch, isOn: this.viewModel.showController })
+          .selectedColor(StreamMenuColors.AccentBlue)
+          .switchPointColor(StreamMenuColors.OnAccent)
+          .width(40)
+          .height(22)
+          .onChange((isOn: boolean) => {
+            if (isOn !== this.viewModel.showController) {
+              this.viewModel.toggleController();
+            }
+          })
+      }
+      .width('100%')
+      .padding({ left: 16, right: 12, top: 14, bottom: 4 })
+
+      Text('屏幕虚拟手柄叠加层')
+        .fontSize(OV_FONT_SM)
+        .fontColor(StreamMenuColors.TextFaint)
+        .width('100%')
+        .padding({ left: 16, right: 16, bottom: this.viewModel.showController ? 8 : 14 })
+
+      if (this.viewModel.showController) {
+        Row().width('85%').height(1).backgroundColor(StreamMenuColors.Divider)
+
+        // 触摸穿透开关
+        Row() {
+          Text('触摸穿透').fontSize(OV_FONT_MD).fontColor(StreamMenuColors.TextMedium)
+          Blank()
+          Toggle({ type: ToggleType.Switch, isOn: this.touchPassthroughLocal })
+            .selectedColor(StreamMenuColors.AccentBlue)
+            .switchPointColor(StreamMenuColors.OnAccent)
+            .width(36)
+            .height(20)
+            .onChange((isOn: boolean) => {
+              this.touchPassthroughLocal = isOn;
+              this.callbacks.onTouchPassthroughChange?.(isOn);
+            })
+        }
+        .width('100%')
+        .padding({ left: 16, right: 12, top: 10, bottom: 4 })
+
+        Text('允许触摸穿透手柄操控画面')
+          .fontSize(OV_FONT_XS)
+          .fontColor(StreamMenuColors.TextFaint)
+          .width('100%')
+          .padding({ left: 16, right: 16, bottom: 4 })
+
+        Row().width('85%').height(1).backgroundColor(StreamMenuColors.Divider)
+
+        // 透明度
+        Column() {
+          Row() {
+            Text('透明度').fontSize(OV_FONT_MD).fontColor(StreamMenuColors.TextMedium)
+            Blank()
+            Text(`${Math.round(this.controllerOpacityLocal * 100)}%`)
+              .fontSize(OV_FONT_MD)
+              .fontColor(StreamMenuColors.AccentBlueText)
+              .fontWeight(FontWeight.Medium)
+          }
+          .width('100%')
+          .padding({ bottom: 4 })
+
+          Slider({
+            value: this.controllerOpacityLocal * 100,
+            min: 20,
+            max: 100,
+            step: 5,
+            style: SliderStyle.OutSet
+          })
+            .width('100%')
+            .blockColor(StreamMenuColors.AccentBlue)
+            .blockSize({ width: 12, height: 12 })
+            .trackColor(StreamMenuColors.Track)
+            .selectedColor(StreamMenuColors.AccentBlue)
+            .showSteps(false)
+            .showTips(false)
+            .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
+            .onChange((value: number, mode: SliderChangeMode) => {
+              this.controllerOpacityLocal = value / 100;
+              this.callbacks.onControllerOpacityChange?.(this.controllerOpacityLocal);
+            })
+
+          Row() {
+            Text('20%').fontSize(OV_FONT_XS).fontColor(StreamMenuColors.TextFaint)
+            Blank()
+            Text('100%').fontSize(OV_FONT_XS).fontColor(StreamMenuColors.TextFaint)
+          }
+          .width('100%')
+        }
+        .width('100%')
+        .padding({ left: 14, right: 14, top: 10, bottom: 4 })
+
+        Row().width('85%').height(1).backgroundColor(StreamMenuColors.Divider)
+
+        // 大小调整
+        Column() {
+          Row() {
+            Text('大小').fontSize(OV_FONT_MD).fontColor(StreamMenuColors.TextMedium)
+            Blank()
+            Text(`${Math.round(this.controllerScaleLocal * 100)}%`)
+              .fontSize(OV_FONT_MD)
+              .fontColor(StreamMenuColors.AccentBlueText)
+              .fontWeight(FontWeight.Medium)
+          }
+          .width('100%')
+          .padding({ bottom: 4 })
+
+          Slider({
+            value: this.controllerScaleLocal * 100,
+            min: 50,
+            max: 200,
+            step: 10,
+            style: SliderStyle.OutSet
+          })
+            .width('100%')
+            .blockColor(StreamMenuColors.AccentBlue)
+            .blockSize({ width: 12, height: 12 })
+            .trackColor(StreamMenuColors.Track)
+            .selectedColor(StreamMenuColors.AccentBlue)
+            .showSteps(false)
+            .showTips(false)
+            .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
+            .onChange((value: number, mode: SliderChangeMode) => {
+              this.controllerScaleLocal = Math.round(value) / 100;
+              this.callbacks.onControllerScaleChange?.(this.controllerScaleLocal);
+            })
+
+          Row() {
+            Text('50%').fontSize(OV_FONT_XS).fontColor(StreamMenuColors.TextFaint)
+            Blank()
+            Text('200%').fontSize(OV_FONT_XS).fontColor(StreamMenuColors.TextFaint)
+          }
+          .width('100%')
+        }
+        .width('100%')
+        .padding({ left: 14, right: 14, top: 10, bottom: 12 })
+      }
+    }
+    .width(OV_CARD_WIDTH)
+    .cardStyle()
+  }
+
+  @Builder
+  AudioVibrationCard() {
+    Column() {
+      Row() {
+        Image($r('app.media.ic_pulse'))
+          .width(OV_FONT_LG)
+          .height(OV_FONT_LG)
+          .fillColor(StreamMenuColors.TextBright)
+        Text(' 音频振动')
+          .fontSize(OV_FONT_LG)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(StreamMenuColors.TextBright)
+        Blank()
+        Toggle({
+          type: ToggleType.Switch,
+          isOn: this.audioVibrationEnabled
+        })
+          .selectedColor(StreamMenuColors.AccentPink)
+          .switchPointColor(StreamMenuColors.OnAccent)
+          .width(40)
+          .height(22)
+          .onChange((isOn: boolean) => {
+            this.audioVibrationEnabled = isOn;
+            this.applyAudioVibrationSettings(true);
+            this.recordCardUsage(CARD_AUDIO_VIBRATION);
+          })
+      }
+      .width('100%')
+      .padding({ left: 16, right: 12, top: 14, bottom: 4 })
+
+      Text(this.audioVibrationEnabled
+        ? '场景和强度会在当前串流中即时生效'
+        : '跟随游戏或音乐节奏产生触觉反馈')
+        .fontSize(OV_FONT_SM)
+        .fontColor(StreamMenuColors.TextFaint)
+        .width('100%')
+        .padding({
+          left: 16,
+          right: 16,
+          bottom: this.audioVibrationEnabled ? 8 : 14
+        })
+
+      if (this.audioVibrationEnabled) {
+        Row().width('85%').height(1).backgroundColor(StreamMenuColors.Divider)
+
+        Column() {
+          Text('场景')
+            .fontSize(OV_FONT_MD)
+            .fontColor(StreamMenuColors.TextMedium)
+            .width('100%')
+            .padding({ bottom: 6 })
+          Row({ space: 8 }) {
+            this.AudioVibrationSceneButton('游戏', '游戏/电影')
+            this.AudioVibrationSceneButton('音乐', '音乐/节奏')
+          }
+          .width('100%')
+        }
+        .width('100%')
+        .padding({ left: 14, right: 14, top: 10, bottom: 8 })
+
+        Column() {
+          Row() {
+            Text('强度').fontSize(OV_FONT_MD).fontColor(StreamMenuColors.TextMedium)
+            Blank()
+            Text(`${this.audioVibrationStrength}%`)
+              .fontSize(OV_FONT_MD)
+              .fontColor(StreamMenuColors.AccentPinkText)
+              .fontWeight(FontWeight.Medium)
+          }
+          .width('100%')
+          .padding({ bottom: 4 })
+
+          Slider({
+            value: this.audioVibrationStrength,
+            min: 10,
+            max: 100,
+            step: 5,
+            style: SliderStyle.OutSet
+          })
+            .width('100%')
+            .blockColor(StreamMenuColors.AccentPink)
+            .trackColor(StreamMenuColors.Track)
+            .selectedColor(StreamMenuColors.AccentPink)
+            .showSteps(false)
+            .showTips(false)
+            .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
+            .onChange((value: number, mode: SliderChangeMode) => {
+              this.audioVibrationStrength =
+                Math.max(10, Math.min(100, Math.round(value / 5) * 5));
+              const persist =
+                mode === SliderChangeMode.End ||
+                mode === SliderChangeMode.Click;
+              this.applyAudioVibrationSettings(persist);
+              if (persist) {
+                this.recordCardUsage(CARD_AUDIO_VIBRATION);
+              }
+            })
+
+          Row() {
+            Text('10%').fontSize(OV_FONT_XS).fontColor(StreamMenuColors.TextFaint)
+            Blank()
+            Text('100%').fontSize(OV_FONT_XS).fontColor(StreamMenuColors.TextFaint)
+          }
+          .width('100%')
+        }
+        .width('100%')
+        .padding({ left: 14, right: 14, bottom: 12 })
+      }
+    }
+    .width(OV_CARD_WIDTH)
+    .cardStyle()
+  }
+
+  @Builder
+  AudioVibrationSceneButton(label: string, sceneMode: string) {
+    Text(label)
+      .fontSize(OV_FONT_MD)
+      .fontWeight(
+        this.audioVibrationSceneMode === sceneMode
+          ? FontWeight.Bold
+          : FontWeight.Normal)
+      .fontColor(
+        this.audioVibrationSceneMode === sceneMode
+          ? StreamMenuColors.TextBright
+          : StreamMenuColors.TextDim)
+      .textAlign(TextAlign.Center)
+      .layoutWeight(1)
+      .padding({ top: 7, bottom: 7 })
+      .borderRadius(14)
+      .backgroundColor(
+        this.audioVibrationSceneMode === sceneMode
+          ? StreamMenuColors.SelectedSurface
+          : StreamMenuColors.Control)
+      .border({
+        width: 1,
+        color: this.audioVibrationSceneMode === sceneMode
+          ? StreamMenuColors.AccentBlue
+          : StreamMenuColors.Border
+      })
+      .onClick(() => {
+        if (this.audioVibrationSceneMode === sceneMode) return;
+        this.audioVibrationSceneMode = sceneMode;
+        this.applyAudioVibrationSettings(true);
+        this.recordCardUsage(CARD_AUDIO_VIBRATION);
+      })
+  }
+
+  @Builder
+  BitrateCard() {
+    Column() {
+      Row() {
+        Image($r('app.media.ic_chart_bar')).width(OV_FONT_LG).height(OV_FONT_LG).fillColor(StreamMenuColors.TextBright)
+        Text(' 码率调整')
+          .fontSize(OV_FONT_LG)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(StreamMenuColors.TextBright)
+        Blank()
+        Text(this.formatBitrate(this.currentBitrate))
+          .fontSize(12)
+          .fontColor(StreamMenuColors.AccentPinkText)
+          .fontWeight(FontWeight.Medium)
+      }
+      .width('100%')
+      .padding({ left: 16, right: 16, top: 14, bottom: 4 })
+
+      // 智能码率开关
+      Row() {
+        Text('智能码率')
+          .fontSize(OV_FONT_MD)
+          .fontColor(StreamMenuColors.TextMedium)
+        Text(this.abrEnabled ? (this.viewModel.getAbrStatusText() || '运行中') : '')
+          .fontSize(OV_FONT_SM)
+          .fontColor(StreamMenuColors.TextFaint)
+          .margin({ left: 6 })
+        Blank()
+        Toggle({ type: ToggleType.Switch, isOn: this.abrEnabled })
+          .selectedColor(StreamMenuColors.AccentBlue)
+          .switchPointColor(StreamMenuColors.OnAccent)
+          .width(40)
+          .height(22)
+          .onChange(async (isOn: boolean) => {
+            this.abrEnabled = isOn;
+            if (isOn) {
+              await this.viewModel.startAbr('balanced');
+              ToastQueue.show({ message: '智能码率已启用', duration: 2000 });
+            } else {
+              await this.viewModel.stopAbr();
+              ToastQueue.show({ message: '智能码率已关闭，恢复手动设置', duration: 2000 });
+              this.currentBitrate = this.viewModel.getCurrentBitrate();
+              this.bitrateSliderValue = this.bitrateToSliderValue(this.currentBitrate);
+            }
+          })
+      }
+      .width('100%')
+      .padding({ left: 16, right: 12, top: 2, bottom: 4 })
+
+      if (!this.abrEnabled) {
+        Text('实时调整串流画质，需 Foundation Sunshine 支持')
+          .fontSize(OV_FONT_SM)
+          .fontColor(StreamMenuColors.TextFaint)
+          .width('100%')
+          .padding({ left: 16, right: 16, bottom: 8 })
+
+        Column() {
+          Slider({
+            value: this.bitrateSliderValue,
+            min: 0,
+            max: 1995,
+            step: 1,
+            style: SliderStyle.OutSet
+          })
+            .width('100%')
+            .blockColor(StreamMenuColors.AccentPink)
+            .trackColor(StreamMenuColors.Track)
+            .selectedColor(StreamMenuColors.AccentPink)
+            .showSteps(false)
+            .showTips(false)
+            .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
+            .onChange((value: number, mode: SliderChangeMode) => {
+              this.bitrateSliderValue = value;
+              if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                this.applyBitrateChange();
+              }
+            })
+
+          Row() {
+            Text('0.5').fontSize(OV_FONT_SM).fontColor(StreamMenuColors.TextDim)
+            Blank()
+            Text(this.isAdjustingBitrate ? '调整中...' : this.formatBitrate(this.sliderValueToBitrate(this.bitrateSliderValue)))
+              .fontSize(OV_FONT_MD)
+              .fontColor(this.isAdjustingBitrate ? StreamMenuColors.TextDim : StreamMenuColors.AccentPinkText)
+              .fontWeight(FontWeight.Bold)
+            Blank()
+            Text('200').fontSize(OV_FONT_SM).fontColor(StreamMenuColors.TextDim)
+          }
+          .width('100%')
+        }
+        .width('100%')
+        .padding({ left: 14, right: 14, bottom: 12 })
+      } else {
+        Text('网络自适应调节中，丢包升高自动降码率')
+          .fontSize(OV_FONT_SM)
+          .fontColor(StreamMenuColors.TextFaint)
+          .width('100%')
+          .padding({ left: 16, right: 16, bottom: 14 })
+      }
+    }
+    .width(OV_CARD_WIDTH)
+    .cardStyle()
+  }
+
+  @Builder
+  GyroAssistCard() {
+    Column() {
+      Row() {
+        Image($r('app.media.ic_game_controller')).width(OV_FONT_LG).height(OV_FONT_LG).fillColor(StreamMenuColors.TextBright)
+        Text(' 体感助手')
+          .fontSize(OV_FONT_LG)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(StreamMenuColors.TextBright)
+        Blank()
+        Toggle({ type: ToggleType.Switch, isOn: this.gyroEnabled })
+          .selectedColor(StreamMenuColors.AccentBlue)
+          .switchPointColor(StreamMenuColors.OnAccent)
+          .width(40)
+          .height(22)
+          .onChange((isOn: boolean) => {
+            this.gyroEnabled = isOn;
+            GyroAssistService.getInstance().setEnabled(isOn);
+            this.saveGyroSetting(SettingsKeys.GYRO_ASSIST_ENABLED, isOn);
+          })
+      }
+      .width('100%')
+      .padding({ left: 16, right: 12, top: 14, bottom: 4 })
+
+      Text(this.hasGyroscope ? '陀螺仪 → 右摇杆映射' : '⚠ 设备无陀螺仪')
+        .fontSize(OV_FONT_SM)
+        .fontColor(this.hasGyroscope ? StreamMenuColors.TextFaint : StreamMenuColors.AccentPinkText)
+        .width('100%')
+        .padding({ left: 16, right: 16, bottom: this.gyroEnabled ? 8 : 14 })
+
+      if (this.gyroEnabled) {
+        Row().width('85%').height(1).backgroundColor(StreamMenuColors.Divider)
+
+        Column() {
+          Row() {
+            Text('灵敏度').fontSize(OV_FONT_MD).fontColor(StreamMenuColors.TextMedium)
+            Blank()
+            Text(`${this.gyroSensitivity.toFixed(1)}x`)
+              .fontSize(OV_FONT_MD)
+              .fontColor(StreamMenuColors.AccentBlueText)
+              .fontWeight(FontWeight.Medium)
+          }
+          .width('100%')
+          .padding({ bottom: 4 })
+
+          Slider({
+            value: this.gyroSensitivity,
+            min: GYRO_SENSITIVITY_MIN,
+            max: GYRO_SENSITIVITY_MAX,
+            step: 0.1,
+            style: SliderStyle.OutSet
+          })
+            .width('100%')
+            .blockColor(StreamMenuColors.AccentBlue)
+            .trackColor(StreamMenuColors.Track)
+            .selectedColor(StreamMenuColors.AccentBlue)
+            .showSteps(false)
+            .showTips(false)
+            .sliderInteractionMode(SliderInteraction.SLIDE_ONLY)
+            .onChange((value: number, mode: SliderChangeMode) => {
+              this.gyroSensitivity = Math.round(value * 10) / 10;
+              GyroAssistService.getInstance().setSensitivity(this.gyroSensitivity);
+              if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                this.saveGyroSetting(SettingsKeys.GYRO_SENSITIVITY, this.gyroSensitivity);
+              }
+            })
+
+          Row() {
+            Text(GYRO_SENSITIVITY_MIN.toFixed(1) + 'x').fontSize(OV_FONT_XS).fontColor(StreamMenuColors.TextFaint)
+            Blank()
+            Text(GYRO_SENSITIVITY_MAX.toFixed(1) + 'x').fontSize(OV_FONT_XS).fontColor(StreamMenuColors.TextFaint)
+          }
+          .width('100%')
+        }
+        .width('100%')
+        .padding({ left: 14, right: 14, top: 10, bottom: 4 })
+
+        this.GyroToggleRow('X轴反转', this.gyroInvertX, (isOn: boolean) => {
+          this.gyroInvertX = isOn;
+          GyroAssistService.getInstance().setInvertX(isOn);
+          this.saveGyroSetting(SettingsKeys.GYRO_INVERT_X, isOn);
+        })
+
+        this.GyroToggleRow('Y轴反转', this.gyroInvertY, (isOn: boolean) => {
+          this.gyroInvertY = isOn;
+          GyroAssistService.getInstance().setInvertY(isOn);
+          this.saveGyroSetting(SettingsKeys.GYRO_INVERT_Y, isOn);
+        })
+
+        Row().width('85%').height(1).backgroundColor(StreamMenuColors.Divider)
+
+        Column() {
+          Text('激活方式').fontSize(OV_FONT_MD).fontColor(StreamMenuColors.TextMedium).width('100%').padding({ bottom: 6 })
+          Row({ space: 8 }) {
+            this.ActivationButton('始终', GYRO_ACTIVATION_ALWAYS)
+            this.ActivationButton('LT', GYRO_ACTIVATION_LT)
+            this.ActivationButton('RT', GYRO_ACTIVATION_RT)
+          }
+          .width('100%')
+          .justifyContent(FlexAlign.Center)
+        }
+        .width('100%')
+        .padding({ left: 16, right: 16, top: 8, bottom: 14 })
+      }
+    }
+    .width(OV_CARD_WIDTH)
+    .cardStyle()
+  }
+
+  @Builder
+  GyroToggleRow(label: string, isOn: boolean, onChange: (isOn: boolean) => void) {
+    Row() {
+      Text(label).fontSize(OV_FONT_MD).fontColor(StreamMenuColors.TextMedium)
+      Blank()
+      Toggle({ type: ToggleType.Switch, isOn: isOn })
+        .selectedColor(StreamMenuColors.AccentBlue)
+        .switchPointColor(StreamMenuColors.OnAccent)
+        .width(36)
+        .height(20)
+        .onChange(onChange)
+    }
+    .width('100%')
+    .padding({ left: 16, right: 12, top: 4, bottom: 4 })
+  }
+
+  @Builder
+  ActivationButton(label: string, key: number) {
+    Text(label)
+      .fontSize(OV_FONT_MD)
+      .fontWeight(this.gyroActivationKey === key ? FontWeight.Bold : FontWeight.Normal)
+      .fontColor(this.gyroActivationKey === key ? StreamMenuColors.TextBright : StreamMenuColors.TextDim)
+      .padding({ left: 16, right: 16, top: 6, bottom: 6 })
+      .borderRadius(14)
+      .backgroundColor(this.gyroActivationKey === key ? StreamMenuColors.SelectedSurface : StreamMenuColors.Control)
+      .border({ width: 1, color: this.gyroActivationKey === key ? StreamMenuColors.AccentBlue : StreamMenuColors.Border })
+      .onClick(() => {
+        this.gyroActivationKey = key;
+        GyroAssistService.getInstance().setActivationKey(key);
+        this.saveGyroSetting(SettingsKeys.GYRO_ACTIVATION_KEY, key);
+      })
+  }
+
+  @Builder
+  SuperCmdCard() {
+    Column() {
+      Row() {
+        Image($r('app.media.ic_crosshair')).width(OV_FONT_LG).height(OV_FONT_LG).fillColor(StreamMenuColors.TextBright)
+        Text(' 服务端指令')
+          .fontSize(OV_FONT_LG)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(StreamMenuColors.TextBright)
+      }
+      .width('100%')
+      .padding({ left: 16, right: 12, top: 14, bottom: 4 })
+
+      Text('执行 Sunshine 预设脚本')
+        .fontSize(OV_FONT_SM)
+        .fontColor(StreamMenuColors.TextFaint)
+        .width('100%')
+        .padding({ left: 16, right: 16, bottom: 6 })
+
+      Scroll() {
+        Flex({ wrap: FlexWrap.Wrap, justifyContent: FlexAlign.Center }) {
+          ForEach(this.superCmds, (cmd: SuperCmd) => {
+            this.SuperCmdPill(cmd)
+          })
+        }
+        .width('100%')
+      }
+      .width('100%')
+      .constraintSize({ maxHeight: 100 })
+      .scrollBar(BarState.Off)
+      .padding({ left: 14, right: 14, top: 10, bottom: 14 })
+    }
+    .width(OV_CARD_WIDTH)
+    .cardStyle()
+  }
+
+  @Builder
+  ShortcutCard() {
+    Column() {
+      Row() {
+        Image($r('app.media.ic_lightning')).width(OV_FONT_LG).height(OV_FONT_LG).fillColor(StreamMenuColors.TextBright)
+        Text(' 快捷键')
+          .fontSize(OV_FONT_LG)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(StreamMenuColors.TextBright)
+        Blank()
+        // 编辑模式切换按钮
+        Text(this.isEditMode ? '✓' : '✎')
+          .fontSize(this.isEditMode ? 14 : 12)
+          .fontColor(this.isEditMode ? StreamMenuColors.Success : StreamMenuColors.TextBright)
+          .fontWeight(FontWeight.Bold)
+          .width(24)
+          .height(24)
+          .textAlign(TextAlign.Center)
+          .borderRadius(12)
+          .backgroundColor(this.isEditMode ? StreamMenuColors.SuccessSurface : StreamMenuColors.BlueSurface)
+          .margin({ right: 6 })
+          .onClick(() => { this.isEditMode = !this.isEditMode; })
+        // 添加按钮
+        Text('＋')
+          .fontSize(14)
+          .fontColor(StreamMenuColors.TextBright)
+          .fontWeight(FontWeight.Bold)
+          .width(24)
+          .height(24)
+          .textAlign(TextAlign.Center)
+          .borderRadius(12)
+          .backgroundColor(StreamMenuColors.BlueSurface)
+          .onClick(() => this.showAddShortcutMenu())
+      }
+      .width('100%')
+      .padding({ left: 16, right: 12, top: 14 })
+
+      Scroll() {
+        Flex({ wrap: FlexWrap.Wrap, justifyContent: FlexAlign.Center }) {
+          ForEach(this.shortcuts, (shortcut: Shortcut) => {
+            this.ShortcutPill(shortcut)
+          })
+        }
+        .width('100%')
+      }
+      .width('100%')
+      .constraintSize({ maxHeight: 120 })
+      .scrollBar(BarState.Off)
+      .padding({ left: 14, right: 14, top: 10, bottom: 14 })
+    }
+    .width(OV_CARD_WIDTH)
+    .cardStyle()
+  }
+
+  @Builder
+  SockButton(index: number) {
+    Row() {
+      Column()
+        .width(22)
+        .height(36)
+        .backgroundColor(this.getMenuBorderColor(index))
+        .borderRadius({ topLeft: 18, bottomLeft: 18 })
+
+      Row() {
+        Text(this.getMenuLabel(index))
+          .fontSize(12)
+          .fontWeight(FontWeight.Bold)
+          .fontColor(this.getMenuTextColor(index))
+      }
+      .width(75)
+      .height(36)
+      .justifyContent(FlexAlign.Center)
+      .alignItems(VerticalAlign.Center)
+      .backgroundColor(this.getMenuBgColor(index))
+
+      Column() {
+        ForEach([0, 1, 2, 3, 4], () => {
+          Row()
+            .width(10)
+            .height(5)
+            .backgroundColor(this.getMenuBorderColor(index))
+            .borderRadius({ topLeft: 5, topRight: 5 })
+            .margin({ top: 2 })
+        })
+      }
+      .height(36)
+      .justifyContent(FlexAlign.Center)
+      .backgroundColor(this.getMenuBgColor(index))
+    }
+    .height(40)
+    .padding(2)
+    .scale({ x: this.scales[index], y: this.scales[index] })
+    .translate({ x: this.positions[index] })
+    .margin({ right: MENU_OFFSETS[index], bottom: 4 })
+    .focusable(true)
+    .focusOnTouch(true)
+    .focusBox({
+      margin: LengthMetrics.vp(2),
+      strokeColor: ColorMetrics.rgba(74, 222, 128, 1),
+      strokeWidth: LengthMetrics.vp(2)
+    })
+    .onKeyEvent((event: KeyEvent) => {
+      if (event.type === KeyType.Down) {
+        if (event.keyCode === 2054 || event.keyCode === 2050) {
+          this.handleMenuClick(index);
+          return true;
+        }
+        if (event.keyCode === 2070 || event.keyCode === 2012) {
+          this.animateOut();
+          return true;
+        }
+      }
+      return false;
+    })
+    .onClick(() => this.handleMenuClick(index))
+  }
+
+  @Builder
+  ShortcutPill(shortcut: Shortcut) {
+    Stack({ alignContent: Alignment.TopEnd }) {
+      Row() {
+        if (shortcut.icon) {
+          Text(shortcut.icon).fontSize(OV_FONT_MD).margin({ right: 4 })
+        }
+        Text(shortcut.name).fontSize(OV_FONT_MD).fontColor(StreamMenuColors.TextBright)
+      }
+      .height(28)
+      .alignItems(VerticalAlign.Center)
+      .padding({ left: 12, right: this.isEditMode ? 16 : 12 })
+      .backgroundColor(this.shortcutSurfaceColor(shortcut.color || '#9DABB2'))
+      .border({
+        width: this.isEditMode && this.dragOverIndex === this.shortcuts.indexOf(shortcut) ? 2 : 1,
+        color: this.isEditMode && this.dragOverIndex === this.shortcuts.indexOf(shortcut)
+          ? StreamMenuColors.Success
+          : this.shortcutBorderColor(shortcut.color || '#9DABB2')
+      })
+      .borderRadius(14)
+      .opacity(this.isEditMode && this.dragFromIndex === this.shortcuts.indexOf(shortcut) ? 0.9 : 1.0)
+
+      // 编辑模式下的删除 badge
+      if (this.isEditMode) {
+        Text('×')
+          .fontSize(10)
+          .fontColor('#FFF')
+          .fontWeight(FontWeight.Bold)
+          .width(16)
+          .height(16)
+          .textAlign(TextAlign.Center)
+          .backgroundColor('#EF4444')
+          .borderRadius(8)
+          .offset({ x: 4, y: -4 })
+          .onClick(async () => {
+            await this.shortcutManager.deleteShortcut(shortcut.id);
+            this.shortcuts = this.shortcutManager.getShortcuts();
+            this.callbacks.onDeleteShortcut?.(shortcut);
+          })
+      }
+    }
+    .margin({ right: 6, bottom: 6 })
+    .focusable(true)
+    .focusOnTouch(true)
+    .focusBox({
+      margin: LengthMetrics.vp(1),
+      strokeColor: ColorMetrics.rgba(74, 222, 128, 0.8),
+      strokeWidth: LengthMetrics.vp(1.5)
+    })
+    .onKeyEvent((event: KeyEvent) => {
+      if (event.type === KeyType.Down) {
+        if (event.keyCode === 2054 || event.keyCode === 2050) {
+          if (!this.isEditMode) {
+            this.sendShortcut(shortcut);
+            this.animateOut();
+          }
+          return true;
+        }
+      }
+      return false;
+    })
+    .onClick(() => {
+      if (this.isEditMode || this.dragFromIndex >= 0) return;
+      this.recordCardUsage(CARD_SHORTCUT);
+      this.sendShortcut(shortcut);
+      this.animateOut();
+    })
+    .gesture(
+      LongPressGesture({ duration: 500 })
+        .onAction(() => {
+          if (this.isEditMode || this.dragFromIndex >= 0) return;
+          // 长按打开编辑器
+          this.callbacks.onEditShortcut?.(shortcut);
+        })
+    )
+    .onDragStart(() => {
+      if (!this.isEditMode) return;
+      this.dragFromIndex = this.shortcuts.indexOf(shortcut);
+    })
+    .onDragEnd(() => {
+      this.dragFromIndex = -1;
+      this.dragOverIndex = -1;
+    })
+    .allowDrop([])
+    .onDragEnter(() => {
+      if (!this.isEditMode) return;
+      this.dragOverIndex = this.shortcuts.indexOf(shortcut);
+    })
+    .onDragLeave(() => {
+      if (this.dragOverIndex === this.shortcuts.indexOf(shortcut)) {
+        this.dragOverIndex = -1;
+      }
+    })
+    .onDrop(async () => {
+      if (!this.isEditMode) return;
+      const toIndex = this.shortcuts.indexOf(shortcut);
+      if (this.dragFromIndex >= 0 && this.dragFromIndex !== toIndex) {
+        await this.shortcutManager.reorderShortcut(this.dragFromIndex, toIndex);
+        this.shortcuts = this.shortcutManager.getShortcuts();
+      }
+      this.dragFromIndex = -1;
+      this.dragOverIndex = -1;
+    })
+  }
+
+  @Builder
+  SuperCmdPill(cmd: SuperCmd) {
+    Row() {
+      Text(cmd.name.charAt(0) || '?')
+        .fontSize(OV_FONT_MD)
+        .fontWeight(FontWeight.Bold)
+        .fontColor(StreamMenuColors.OnAccent)
+        .width(20)
+        .height(20)
+        .textAlign(TextAlign.Center)
+        .backgroundColor(StreamMenuColors.AccentBlue)
+        .borderRadius(10)
+        .margin({ right: 6 })
+      Text(cmd.name).fontSize(OV_FONT_MD).fontColor(StreamMenuColors.TextBright)
+    }
+    .padding({ left: 6, right: 12, top: 6, bottom: 6 })
+    .backgroundColor(StreamMenuColors.Control)
+    .border({ width: 1, color: StreamMenuColors.Border })
+    .borderRadius(16)
+    .margin({ right: 6, bottom: 6 })
+    .focusable(true)
+    .focusOnTouch(true)
+    .focusBox({
+      margin: LengthMetrics.vp(1),
+      strokeColor: ColorMetrics.rgba(96, 165, 250, 0.8),
+      strokeWidth: LengthMetrics.vp(1.5)
+    })
+    .onKeyEvent((event: KeyEvent) => {
+      if (event.type === KeyType.Down && (event.keyCode === 2054 || event.keyCode === 2050)) {
+        this.callbacks.onSendSuperCmd?.(cmd.id);
+        this.animateOut();
+        return true;
+      }
+      return false;
+    })
+    .onClick(() => {
+      this.recordCardUsage(CARD_SUPERCMD);
+      this.callbacks.onSendSuperCmd?.(cmd.id);
+      this.animateOut();
+    })
+  }
+}

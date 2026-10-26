@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240" width="240" height="240" fill="none" role="img" aria-label="这次较差">
+  <title>串流报告 · 较差</title>
+  <desc>一条向下走的折线，终点是一个偏小的点。火还在，但路在往下。</desc>
+  <path d="M44 110 L88 128 L128 116 L172 152 L204 166" stroke="#8A9A94" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="204" cy="166" r="14" fill="#8A9A94"/>
+</svg>

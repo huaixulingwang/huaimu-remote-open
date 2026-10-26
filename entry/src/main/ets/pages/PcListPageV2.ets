@@ -1,0 +1,1380 @@
+/*
+ * Moonlight for HarmonyOS
+ * Copyright (C) 2024-2025 Moonlight/AlkaidLab
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ */
+
+import { promptAction } from '@kit.ArkUI';
+import { AppNav } from '../common/AppNav';
+import { AppListPageParams, HostWebUiPageParams } from '../common/PageParams';
+import { ComputerInfo, PairState, selectBestAddress } from '../model/ComputerInfo';
+import { ComputerManager } from '../service/ComputerManager';
+import { ComputerCard } from '../components/ComputerCard';
+import { ComputerListViewModel, ObservableComputer, ComputerDataSource } from '../viewmodel/ComputerViewModel';
+import { AppColors, AppSizes, AppSpacing } from '../common/Theme';
+import { common } from '@kit.AbilityKit';
+import { buffer } from '@kit.ArkTS';
+import { BackgroundImageUtil, BackgroundImageType } from '../utils/BackgroundImageUtil';
+import { BackgroundImage } from '../components/BackgroundImage';
+import { sensor } from '@kit.SensorServiceKit';
+import { OptionPickerDialog, OptionPickerDialogConfig, OptionItem } from '../components/dialogs/OptionPickerDialog';
+import { ConfirmDialog, ConfirmDialogConfig, InfoDialog, InfoDialogConfig } from '../components/dialogs/ConfirmDialog';
+import { BusinessError } from '@kit.BasicServicesKit';
+import { photoAccessHelper } from '@kit.MediaLibraryKit';
+import { fileIo } from '@kit.CoreFileKit';
+import { ComputerMenuHelper, ComputerMenuCallbacks } from '../viewmodel/ComputerMenuHelper';
+import { PcListActions, PcListUICallbacks } from '../viewmodel/PcListActions';
+import { PairingManager, PairState as PMPairState } from '../service/network/PairingManager';
+import { QrShareService } from '../service/network/QrShareService';
+import { CustomKeyStore } from '../service/customkey/CustomKeyStore';
+import { PcListTitleBar, TitleBarConfig } from '../components/PcListTitleBar';
+import { PinDialogView, AboutDialogView } from '../components/dialogs/PcListDialogs';
+import { ConnectingDialog } from '../components/ConnectingDialog';
+import { SettingsBackupService } from '../service/SettingsBackupService';
+import { AccountCenterService, AccountDevice } from '../service/account/AccountCenterService';
+import { LocalIdentity } from '../service/network/LocalIdentity';
+import { HOST_VIRTUAL_IP, VpnController } from '../service/networking/VpnController';
+import { EasyTierManager } from '../service/networking/EasyTierManager';
+import { PreferencesUtil } from '../utils/PreferencesUtil';
+import { ToastQueue } from '../utils/ToastQueue';
+import { Logger } from '../common/Logger';
+import { UI } from '../common/UI';
+
+/** 控制码连接时的电脑选择按钮 */
+interface AccessCodeDialogButton {
+  text: string;
+  color: string;
+}
+
+/**
+ * 电脑列表页面 (现代化版本)
+ *
+ * 功能:
+ * - 显示已添加的电脑列表
+ * - 支持下拉刷新
+ * - 支持 mDNS 自动发现
+ * - 支持 WOL 唤醒
+ * - 支持配对/取消配对
+ */
+@Component
+struct PcListPageV2 {
+  @State viewModel: ComputerListViewModel = new ComputerListViewModel();
+  @State isRefreshing: boolean = false;
+  @State isScanning: boolean = false;
+  @State isInitializing: boolean = true;
+  @State showPinDialog: boolean = false;
+  @State currentPin: string = '';
+  @State pairingComputerName: string = '';
+  @State backgroundImageUrl: string = '';
+  @State showAboutDialog: boolean = false;
+  @State isLandscape: boolean = false;  // 横屏检测
+  @State screenWidth: number = 0;       // 屏幕宽度
+  @State canScanQrCode: boolean = true; // 当前设备是否支持系统扫码
+  @State otherDevices: AccountDevice[] = []; // 同账号的平板/手机（小面积分组）
+  @State selfDeviceId: string = '';          // 本机在账号名单里的标识
+  @State netState: number = 0;               // 0=未组网 1=连接中 2=已连接
+  @State netHint: string = '正在检测虚拟专网…';
+  @StorageProp('topSafeHeight') topSafeHeight: number = 56;  // 动态状态栏安全区高度
+
+  // LazyForEach 数据源
+  private computerDataSource: ComputerDataSource = new ComputerDataSource();
+
+  private computerManager: ComputerManager = ComputerManager.getInstance();
+  private backgroundUtil: BackgroundImageUtil = BackgroundImageUtil.getInstance();
+  private actions: PcListActions | null = null;
+
+  // 摇一摇相关
+  private lastShakeTime: number = 0;
+  private shakeThreshold: number = 15; // 加速度阈值
+  private shakeCooldown: number = 2000; // 2秒冷却时间
+
+  // CustomDialogController 配置
+  private optionPickerDialogConfig: OptionPickerDialogConfig = {
+    title: '',
+    options: [],
+    onSelect: () => {}
+  };
+  private confirmDialogConfig: ConfirmDialogConfig = {
+    title: '',
+    message: '',
+    confirmButton: { text: '', onClick: () => {} }
+  };
+  private infoDialogConfig: InfoDialogConfig = {
+    title: '',
+    content: ''
+  };
+
+  // CustomDialogController 实例
+  private optionPickerDialogController: CustomDialogController | null = null;
+  private confirmDialogController: CustomDialogController | null = null;
+  private infoDialogController: CustomDialogController | null = null;
+
+  /**
+   * 显示确认弹窗
+   */
+  private showConfirmDialog(config: ConfirmDialogConfig): void {
+    this.confirmDialogConfig = config;
+    this.confirmDialogController = new CustomDialogController({
+      builder: ConfirmDialog({
+        config: this.confirmDialogConfig
+      }),
+      alignment: DialogAlignment.Center,
+      customStyle: true,
+      backgroundColor: Color.Transparent
+    });
+    this.confirmDialogController.open();
+  }
+
+  /**
+   * 显示信息弹窗
+   */
+  private showInfoDialog(config: InfoDialogConfig): void {
+    this.infoDialogConfig = config;
+    this.infoDialogController = new CustomDialogController({
+      builder: InfoDialog({
+        config: this.infoDialogConfig
+      }),
+      alignment: DialogAlignment.Center,
+      customStyle: true,
+      backgroundColor: Color.Transparent
+    });
+    this.infoDialogController.open();
+  }
+
+  aboutToAppear(): void {
+    // 先设置 context 以便后续使用本地缓存
+    const context = getContext(this) as common.UIAbilityContext;
+    this.backgroundUtil.setContext(context);
+    this.canScanQrCode = QrShareService.isScanQrCodeSupported();
+
+    // 初始化业务逻辑处理类
+    this.actions = new PcListActions({
+      showConfirmDialog: (config: ConfirmDialogConfig) => this.showConfirmDialog(config),
+      showInfoDialog: (config: InfoDialogConfig) => this.showInfoDialog(config),
+      syncViewModel: () => { this.syncViewModelFromManager(); },
+      showPinDialog: (pin: string, computerName: string) => {
+        this.currentPin = pin;
+        this.pairingComputerName = computerName;
+        this.showPinDialog = true;
+      },
+      hidePinDialog: () => { this.showPinDialog = false; }
+    } as PcListUICallbacks);
+
+    this.initializeAsync();
+    this.syncAccountDevices();
+    this.loadBackgroundImage();
+    this.startShakeDetection();
+  }
+
+  /**
+   * 账号设备名单同步：
+   * - 把本机（平板）登记到账号
+   * - 同账号的电脑自动加入本地列表（未配对，首次连接时配对一次）
+   */
+  private async syncAccountDevices(): Promise<void> {
+    try {
+      const snapshot = await AccountCenterService.getSnapshot();
+      if (!snapshot.loggedIn) {
+        // 退出账号：清掉这个账号同步下来的本地痕迹（未配对的账号设备 + 其他设备列表）
+        this.otherDevices = [];
+        await this.computerManager.removeAccountDevices();
+        this.syncViewModelFromManager();
+        return;
+      }
+      await AccountCenterService.registerThisDevice();
+      const selfId: string = await LocalIdentity.getClientId();
+      this.selfDeviceId = selfId;
+      const devices = await AccountCenterService.fetchDevices();
+      const others: AccountDevice[] = [];
+      for (const device of devices) {
+        if (device.device_type !== 'pc') {
+          others.push(device);
+          continue;
+        }
+        const uuid: string = device.sunshine_id === undefined ? '' : device.sunshine_id;
+        if (uuid.length === 0) {
+          continue;
+        }
+        const address: string = (device.virtual_ip !== undefined && device.virtual_ip.length > 0)
+          ? device.virtual_ip
+          : HOST_VIRTUAL_IP;
+        const name: string = device.device_name.length > 0 ? device.device_name : '电脑';
+        await this.computerManager.addAccountDevice(uuid, name, address);
+      }
+      this.otherDevices = others;
+    } catch (err) {
+      Logger.warn('PcListPageV2', `同步账号设备失败: ${(err as Error).message}`);
+    }
+  }
+
+  /** 控制码连接：选一台已配对电脑，进入控制码页 */
+  private startAccessCodeFlow(): void {
+    const paired: ObservableComputer[] = [];
+    for (let i = 0; i < this.computerDataSource.totalCount(); i++) {
+      const item = this.computerDataSource.getData(i);
+      if (item.isPaired) {
+        paired.push(item);
+      }
+    }
+
+    if (paired.length === 0) {
+      this.showInfoDialog({
+        title: '还没有可连接的电脑',
+        content: '请先添加并配对一台电脑，再用电脑端生成的控制码连接。'
+      });
+      return;
+    }
+    if (paired.length === 1) {
+      this.actions?.connectWithAccessCode(paired[0]);
+      return;
+    }
+
+    const buttons: AccessCodeDialogButton[] = [];
+    for (let i = 0; i < 3 && i < paired.length; i++) {
+      buttons.push({ text: paired[i].name, color: '#26A67C' } as AccessCodeDialogButton);
+    }
+    promptAction.showDialog({
+      title: '选择要连接的电脑',
+      message: '输入电脑端生成的控制码即可连接',
+      buttons: buttons
+    }).then((result) => {
+      const chosen = paired[result.index];
+      if (chosen) {
+        this.actions?.connectWithAccessCode(chosen);
+      }
+    }).catch(() => {});
+  }
+
+  private async loadBackgroundImage(): Promise<void> {
+    try {
+      // 先检查背景图类型，如果是 NONE 则不加载
+      const bgType = await this.backgroundUtil.getBackgroundImageType();
+      if (bgType === BackgroundImageType.NONE) {
+        this.backgroundImageUrl = '';
+        AppStorage.setOrCreate<string>('globalBackgroundImageUrl', '');
+        return;
+      }
+
+      // 首次使用检查免责声明
+      const disclaimerAccepted = await this.backgroundUtil.isDisclaimerAccepted();
+      if (!disclaimerAccepted) {
+        // 显示免责声明弹窗
+        this.showBackgroundDisclaimerDialog();
+        return;
+      }
+
+      // 优先使用本地缓存的图片
+      const localPath = await this.backgroundUtil.downloadToLocalCache();
+      if (localPath) {
+        this.backgroundImageUrl = 'file://' + localPath;
+      } else {
+        // 如果本地缓存失败，使用在线 URL
+        this.backgroundImageUrl = await this.backgroundUtil.getBackgroundImageUrl();
+      }
+      // 发布到全局：StreamPage 连接中遮罩在没有应用海报时底到这张背景图
+      AppStorage.setOrCreate<string>('globalBackgroundImageUrl', this.backgroundImageUrl);
+    } catch (err) {
+      // 忽略错误
+    }
+  }
+
+  /**
+   * 页面返回时重新加载背景图设置
+   * 用户可能在设置页面更改了背景图类型
+   */
+  private async reloadBackgroundImage(): Promise<void> {
+    try {
+      // 检查类型是否发生变化
+      const typeChanged = await this.backgroundUtil.reload();
+      const currentType = await this.backgroundUtil.getBackgroundImageType();
+      if (currentType === BackgroundImageType.NONE) {
+        this.backgroundImageUrl = '';
+        AppStorage.setOrCreate<string>('globalBackgroundImageUrl', '');
+      } else if (typeChanged) {
+        // 类型变化，重新加载（缓存已在 setBackgroundImageType 中清除）
+        this.loadBackgroundImage();
+      }
+    } catch (err) {
+      // 忽略错误
+    }
+  }
+
+  /**
+   * 显示背景图免责声明弹窗
+   */
+  private showBackgroundDisclaimerDialog(): void {
+    const config: ConfirmDialogConfig = {
+      title: '背景壁纸功能说明',
+      message: '本应用的背景壁纸来自互联网公开资源（Pipw API），图片版权归原作者所有。\n\n' +
+        '• 本应用仅提供技术链接，不存储、不拥有这些图片的版权\n' +
+        '• 如有侵权，请联系原图片来源方\n' +
+        '• 您可以在设置中随时关闭壁纸功能或切换为其他来源\n\n' +
+        '继续使用即表示您知悉并同意上述条款。',
+      cancelButton: {
+        text: '关闭壁纸',
+        onClick: async () => {
+          // 用户选择关闭壁纸，设置为 NONE
+          await this.backgroundUtil.setDisclaimerAccepted();
+          await this.backgroundUtil.disableBackgroundImage();
+          this.backgroundImageUrl = '';
+        }
+      },
+      confirmButton: {
+        text: '知悉并继续',
+        onClick: async () => {
+          // 用户同意，保存状态并加载壁纸
+          await this.backgroundUtil.setDisclaimerAccepted();
+          this.loadBackgroundImageAfterDisclaimer();
+        }
+      }
+    };
+    this.showConfirmDialog(config);
+  }
+
+  /**
+   * 免责声明确认后加载背景图
+   */
+  private async loadBackgroundImageAfterDisclaimer(): Promise<void> {
+    try {
+      const localPath = await this.backgroundUtil.downloadToLocalCache();
+      if (localPath) {
+        this.backgroundImageUrl = 'file://' + localPath;
+      } else {
+        this.backgroundImageUrl = await this.backgroundUtil.getBackgroundImageUrl();
+      }
+    } catch (err) {
+      // 忽略错误
+    }
+  }
+
+  private async initializeAsync(): Promise<void> {
+    try {
+      const context = getContext(this) as common.UIAbilityContext;
+      await this.computerManager.init(context);
+
+      this.computerManager.setOnComputerListChangedListener(() => {
+        this.syncViewModelFromManager();
+      });
+
+      this.syncViewModelFromManager();
+      this.computerManager.startBackgroundScan();
+
+      // 打开软件就自动组网：这样列表里的"在线/离线"才是实时的
+      this.autoStartNetwork();
+
+      this.isInitializing = false;
+
+      // 首次安装检测：提示从备份恢复
+      this.checkFirstLaunchRestore();
+
+      // 异步刷新状态
+      this.computerManager.refreshAllComputers().then(() => {
+        this.syncViewModelFromManager();
+        // 启动轮询
+        this.computerManager.startPolling();
+        // 配对名单是异步读出来的，首次调用可能还没数据，这里补一次（已连上会直接返回）
+        this.autoStartNetwork();
+      }).catch((err: Error) => {
+        Logger.error('PcListPageV2', '[MOONLIGHT] PcListPage: 刷新失败', err);
+        // 启动轮询
+        this.computerManager.startPolling();
+        this.autoStartNetwork();
+      });
+    } catch (err) {
+      Logger.error('PcListPageV2', 'PcListPage: 初始化失败', err);
+      this.isInitializing = false;
+    }
+  }
+
+  /**
+   * 首次安装检测：如果电脑列表为空且未提示过，弹窗询问是否从备份恢复
+   */
+  private async checkFirstLaunchRestore(): Promise<void> {
+    try {
+      const prompted = await PreferencesUtil.get<boolean>('backup_restore_prompted', false);
+      if (prompted) return;
+
+      // 标记已提示（无论用户是否恢复）
+      await PreferencesUtil.put('backup_restore_prompted', true);
+
+      if (this.viewModel.computers.length > 0) return;
+
+      this.showConfirmDialog({
+        title: '恢复设置',
+        message: '检测到首次使用，是否从备份文件恢复设置？',
+        confirmButton: {
+          text: '选择备份文件',
+          onClick: async () => {
+            await SettingsBackupService.importFromFile();
+          }
+        },
+        cancelButton: {
+          text: '跳过',
+          onClick: () => {}
+        }
+      });
+    } catch (e) {
+      // 静默忽略
+    }
+  }
+
+  private async syncViewModelFromManager(): Promise<void> {
+    const computers = await this.computerManager.getComputers();
+
+    // 创建 UUID 到电脑信息的映射
+    const computerMap = new Map<string, ComputerInfo>();
+    for (const c of computers) {
+      computerMap.set(c.uuid, c);
+    }
+
+    // 获取现有的 ObservableComputer 列表
+    const existingMap = new Map<string, ObservableComputer>();
+    for (const oc of this.viewModel.computers) {
+      existingMap.set(oc.uuid, oc);
+    }
+
+    // 构建新的列表，复用现有对象以避免重新渲染
+    const newList: ObservableComputer[] = [];
+    let hasChanges = false;
+    let shouldRefreshComputerList = false;
+
+    for (const c of computers) {
+      const existing = existingMap.get(c.uuid);
+      if (existing) {
+        const previousOnlineTransitionVersion = existing.onlineTransitionVersion;
+        // 更新现有对象的属性（@Observed 会处理响应式更新）
+        existing.updateFrom(c);
+        if (existing.onlineTransitionVersion !== previousOnlineTransitionVersion) {
+          shouldRefreshComputerList = true;
+        }
+        newList.push(existing);
+        existingMap.delete(c.uuid);
+      } else {
+        // 新电脑，创建新对象
+        newList.push(new ObservableComputer(c));
+        hasChanges = true;
+      }
+    }
+
+    // 如果有电脑被删除
+    if (existingMap.size > 0) {
+      hasChanges = true;
+    }
+
+    // 电脑数量、排序或上线动效事件变化时才替换数组
+    if (hasChanges || this.viewModel.computers.length !== newList.length || shouldRefreshComputerList) {
+      // 排序：在线已配对 > 在线未配对 > 离线，同优先级按名称排序
+      newList.sort((a, b) => {
+        const getPriority = (c: ObservableComputer): number => {
+          if (c.isOnline && c.isPaired) return 0;  // 在线已配对
+          if (c.isOnline) return 1;                  // 在线未配对
+          return 2;                                   // 离线
+        };
+        const pa = getPriority(a);
+        const pb = getPriority(b);
+        if (pa !== pb) {
+          return pa - pb;
+        }
+        return a.name.localeCompare(b.name);
+      });
+      this.viewModel.computers = newList;
+      // 同步更新 LazyForEach 数据源
+      this.computerDataSource.reloadData(newList);
+    }
+
+    // 更新缓存的统计值，确保 UI 显示正确
+    this.viewModel.computerCount = newList.length;
+    this.viewModel.onlineCount = newList.filter(c => c.isOnline).length;
+  }
+
+  aboutToDisappear(): void {
+    this.computerManager.stopBackgroundScan();
+    this.computerManager.stopPolling();
+    this.stopShakeDetection();
+  }
+
+  onPageShow(): void {
+    // 页面再次显示时启动轮询
+    this.computerManager.startPolling();
+    if (!this.isInitializing) {
+      // 回到首页时重新对一次账号名单：登录后同步、退出后清理
+      this.syncAccountDevices();
+      // 先同步当前数据
+      this.syncViewModelFromManager();
+      // 立即刷新一次状态（异步），确保显示最新的游戏运行状态
+      this.computerManager.refreshAllComputers().then(() => {
+        this.syncViewModelFromManager();
+      }).catch((err: Error) => {
+        Logger.warn('PcListPageV2', '[MOONLIGHT] PcListPage: 刷新失败', err);
+      });
+      // 重新加载背景图设置（用户可能在设置中更改了背景图类型）
+      // 注意：首次加载时 aboutToAppear 已调用 loadBackgroundImage，不需要重复
+      this.reloadBackgroundImage();
+    }
+    // 重新启动摇一摇检测
+    this.startShakeDetection();
+  }
+
+  onPageHide(): void {
+    // 页面隐藏时停止轮询（节省资源）
+    this.computerManager.stopPolling();
+    // 停止摇一摇检测
+    this.stopShakeDetection();
+  }
+
+  // 启动摇一摇检测
+  private startShakeDetection(): void {
+    try {
+      sensor.on(sensor.SensorId.ACCELEROMETER, (data) => {
+        const x = data.x;
+        const y = data.y;
+        const z = data.z;
+        const acceleration = Math.sqrt(x * x + y * y + z * z);
+
+        // 检测是否超过阈值（摇一摇动作）
+        // 正常重力加速度约为9.8，需要减去
+        const shakeForce = Math.abs(acceleration - 9.8);
+
+        if (shakeForce > this.shakeThreshold) {
+          const now = Date.now();
+          // 冷却时间检查，防止连续触发
+          if (now - this.lastShakeTime > this.shakeCooldown) {
+            this.lastShakeTime = now;
+            this.refreshWallpaper();
+          }
+        }
+      }, { interval: 100000000 }); // 100ms 采样间隔
+    } catch (err) {
+      // 某些设备可能不支持加速度传感器
+    }
+  }
+
+  // 停止摇一摇检测
+  private stopShakeDetection(): void {
+    try {
+      sensor.off(sensor.SensorId.ACCELEROMETER);
+    } catch (err) {
+      // 忽略错误
+    }
+  }
+
+  /**
+   * 打开软件就自动组网。
+   * 只有存在已配对电脑时才需要组网；已经连上就直接复用，不重复建立。
+   */
+  private async autoStartNetwork(): Promise<void> {
+    if (this.netState === 1 || this.netState === 2) {
+      return;
+    }
+    try {
+      const running: boolean = await EasyTierManager.getInstance().isRunning();
+      if (running) {
+        this.netState = 2;
+        this.netHint = '虚拟专网已连接';
+        return;
+      }
+    } catch (_) {
+    }
+
+    const paired: ObservableComputer[] =
+      this.viewModel.computers.filter((c: ObservableComputer) => c.isPaired);
+    if (paired.length === 0) {
+      this.netState = 0;
+      this.netHint = '还没有添加电脑';
+      return;
+    }
+
+    this.netState = 1;
+    this.netHint = '正在建立安全连接…';
+    try {
+      const ok: boolean = await VpnController.getInstance().start(HOST_VIRTUAL_IP);
+      if (ok) {
+        this.netState = 2;
+        this.netHint = '虚拟专网已连接';
+        this.computerManager.refreshAllComputers().then(() => {
+          this.syncViewModelFromManager();
+        }).catch(() => {
+        });
+      } else {
+        this.netState = 0;
+        const hint: string = VpnController.getInstance().getLastFailureHint();
+        this.netHint = hint.length > 0 ? hint : '连接没有建立成功，可点右侧重试';
+      }
+    } catch (err) {
+      this.netState = 0;
+      this.netHint = '连接没有建立成功，可点右侧重试';
+      Logger.warn('PcListPageV2', `自动组网失败: ${(err as Error).message}`);
+    }
+  }
+
+  /** 虚拟专网状态卡片：组网状态 + 在线电脑数 */
+  @Builder
+  NetworkCard() {
+    Row({ space: 10 }) {
+      Circle({ width: 8, height: 8 })
+        .fill(this.netState === 2 ? '#2ED47A' : (this.netState === 1 ? '#F0A020' : '#9AA0A6'))
+
+      Column({ space: 2 }) {
+        Text(this.netState === 2 ? '虚拟专网已连接'
+          : (this.netState === 1 ? '正在建立安全连接…' : '虚拟专网未连接'))
+          .fontSize(13)
+          .fontColor(AppColors.TextPrimary)
+        Text(this.netHint)
+          .fontSize(11)
+          .fontColor(AppColors.TextTertiary)
+      }
+      .alignItems(HorizontalAlign.Start)
+      .layoutWeight(1)
+
+      if (this.viewModel.computerCount > 0) {
+        Text(`在线 ${this.viewModel.onlineCount}/${this.viewModel.computerCount}`)
+          .fontSize(11)
+          .fontColor(this.viewModel.onlineCount > 0 ? '#2ED47A' : AppColors.TextTertiary)
+      }
+
+      if (this.netState !== 1) {
+        Text(this.netState === 2 ? '刷新' : '重试')
+          .fontSize(12)
+          .fontColor(AppColors.Accent)
+          .onClick(() => {
+            if (this.netState === 2) {
+              this.computerManager.refreshAllComputers().then(() => {
+                this.syncViewModelFromManager();
+              }).catch(() => {
+              });
+            } else {
+              this.netState = 0;
+              this.autoStartNetwork();
+            }
+          })
+      }
+    }
+    .width('100%')
+    .padding({ left: 14, right: 14, top: 10, bottom: 10 })
+    .backgroundColor(AppColors.CardBackground)
+    .borderRadius(12)
+    .border({ width: 1, color: AppColors.CardBorder })
+    .margin({ left: AppSpacing.Large, right: AppSpacing.Large, bottom: 8 })
+  }
+
+  build() {
+    NavDestination() {
+    Stack() {
+      // 背景图层
+      BackgroundImage({ imageUrl: this.backgroundImageUrl, imageOpacity: 0.7 })
+
+      // 主内容
+      Column() {
+        // 标题栏
+        PcListTitleBar({
+          config: {
+            onlineCount: this.viewModel.onlineCount,
+            totalCount: this.viewModel.computerCount,
+            showScanImport: this.canScanQrCode,
+            onAboutClick: () => { this.showAboutDialog = true; },
+            onScanImport: () => { this.scanAndImportKeys(); },
+            onSettingsClick: () => { AppNav.push('SettingsPageV2'); }
+          } as TitleBarConfig
+        })
+
+        // 虚拟专网状态 + 在线电脑数
+        this.NetworkCard()
+
+        // 电脑列表或空状态
+        if (this.isInitializing) {
+          this.LoadingState()
+        } else if (this.viewModel.computers.length === 0) {
+          this.EmptyState()
+        } else {
+          // 分组：可远程控制的电脑占主区域
+          Row() {
+            Text('我的电脑')
+              .fontSize(12)
+              .fontColor(AppColors.TextSecondary)
+            Blank()
+            Text(`${this.viewModel.computers.length} 台`)
+              .fontSize(11)
+              .fontColor(AppColors.TextTertiary)
+          }
+          .width('100%')
+          .padding({ left: AppSpacing.Large, right: AppSpacing.Large })
+          .margin({ bottom: 6 })
+
+          this.ComputerList()
+        }
+
+        // 分组：同账号的平板/手机，小面积展示（不可远程控制）
+        if (this.otherDevices.length > 0) {
+          this.OthersSection()
+        }
+
+        // 底部操作栏 (有电脑时显示，空状态由 EmptyState 自带按钮)
+        if (!this.isInitializing && this.viewModel.computers.length > 0) {
+          this.BottomBar()
+        }
+      }
+      .width('100%')
+      .height('100%')
+      .defaultFocus(true)
+
+      // PIN 对话框
+      if (this.showPinDialog) {
+        PinDialogView({
+          pin: this.currentPin,
+          computerName: this.pairingComputerName,
+          onClose: () => { this.showPinDialog = false; }
+        })
+      }
+
+      // 关于对话框
+      if (this.showAboutDialog) {
+        AboutDialogView({
+          onClose: () => { this.showAboutDialog = false; }
+        })
+      }
+
+      // 连接中进度弹框（全程显示、可取消），保持最后一个子组件以置顶显示
+      ConnectingDialog()
+    }
+    .width('100%')
+    .height('100%')
+    .onAreaChange((oldValue: Area, newValue: Area) => {
+      // 检测屏幕尺寸变化（旋转屏幕时）
+      const width = newValue.width as number;
+      const height = newValue.height as number;
+      this.screenWidth = width;
+      this.isLandscape = width > height;
+    })
+    }
+    .hideTitleBar(true)
+    .onShown(() => this.onPageShow())
+    .onHidden(() => this.onPageHide())
+    .onBackPressed(() => {
+      // 根页面：返回键退到后台（router 时代首页按返回的系统默认行为，进程保活可秒恢复）
+      if (AppNav.stack.size() <= 1) {
+        (UI.get().getHostContext() as common.UIAbilityContext).moveAbilityToBackground();
+        return true;
+      }
+      return false;
+    })
+  }
+
+  @Builder
+  LoadingState() {
+    Column() {
+      LoadingProgress()
+        .width(48)
+        .height(48)
+        .color(AppColors.Primary)
+      Text('正在加载...')
+        .fontSize(AppSizes.FontBody)
+        .fontColor(AppColors.TextSecondary)
+        .margin({ top: AppSpacing.Large })
+    }
+    .width('100%')
+    .height('100%')
+    .justifyContent(FlexAlign.Center)
+  }
+
+  @Builder
+  EmptyState() {
+    Column() {
+      // 霓虹风格插图
+      Column() {
+        Image($r('app.media.ic_game_controller'))
+          .width(48)
+          .height(48)
+          .fillColor(AppColors.Primary)
+      }
+      .width(120)
+      .height(120)
+      .borderRadius(60)
+      .backgroundColor(AppColors.Surface)
+      .borderWidth(2)
+      .borderColor(AppColors.Primary)
+      .justifyContent(FlexAlign.Center)
+      .margin({ bottom: AppSpacing.XLarge })
+
+      Text('开始连接')
+        .fontSize(AppSizes.FontTitle)
+        .fontWeight(FontWeight.Bold)
+        .fontColor(AppColors.Primary)
+        .margin({ bottom: AppSpacing.Small })
+
+      Text('扫描局域网中的电脑，或登录同一账号后连接')
+        .fontSize(AppSizes.FontBody)
+        .fontColor(AppColors.TextSecondary)
+        .textAlign(TextAlign.Center)
+        .padding({ left: AppSpacing.XXLarge, right: AppSpacing.XXLarge })
+
+      Text('也可以手动输入 IP 地址添加')
+        .fontSize(AppSizes.FontCaption)
+        .fontColor(AppColors.TextTertiary)
+        .margin({ top: AppSpacing.Small })
+
+      // 快速操作按钮 - 霓虹风格
+      Row() {
+        Button({ type: ButtonType.Normal }) {
+          Row() {
+            Image($r('app.media.ic_refresh'))
+              .width(20)
+              .height(20)
+              .fillColor(AppColors.TextOnPrimary)
+              .margin({ right: 8 })
+            Text('刷新')
+              .fontSize(AppSizes.FontBody)
+              .fontWeight(FontWeight.Medium)
+              .fontColor(AppColors.TextOnPrimary)
+          }
+        }
+        .height(48)
+        .padding({ left: AppSpacing.XLarge, right: AppSpacing.XLarge })
+        .borderRadius(AppSizes.RadiusLarge)
+        .backgroundColor(AppColors.Primary)
+        .enabled(!this.isScanning)
+        .onClick(() => this.refreshKnownHosts())
+
+        Button({ type: ButtonType.Normal }) {
+          Row() {
+            Image($r('app.media.ic_add'))
+              .width(20)
+              .height(20)
+              .fillColor(AppColors.Primary)
+              .margin({ right: 8 })
+            Text('添加电脑')
+              .fontSize(AppSizes.FontBody)
+              .fontWeight(FontWeight.Medium)
+              .fontColor(AppColors.Primary)
+          }
+        }
+        .height(48)
+        .padding({ left: AppSpacing.XLarge, right: AppSpacing.XLarge })
+        .borderRadius(AppSizes.RadiusLarge)
+        .backgroundColor(Color.Transparent)
+        .borderWidth(1.5)
+        .borderColor(AppColors.Primary)
+        .margin({ left: AppSpacing.Medium })
+        .onClick(() => AppNav.push('AddPcPageV2'))
+      }
+      .margin({ top: AppSpacing.XXLarge })
+    }
+    .width('100%')
+    .height('100%')
+    .justifyContent(FlexAlign.Center)
+  }
+
+  /**
+   * 计算网格列数
+   * 横屏或宽屏时使用多列布局
+   */
+  private getGridColumns(): number {
+    if (this.screenWidth >= 900) return 3;  // 大屏幕 3 列
+    if (this.screenWidth >= 600 || this.isLandscape) return 2;  // 中等屏幕或横屏 2 列
+    return 1;  // 竖屏单列
+  }
+
+  private otherDeviceTypeLabel(type: string): string {
+    return type === 'phone' ? '手机' : '平板';
+  }
+
+  /**
+   * 其他设备分组：同账号的平板/手机，用小卡片展示（不可远程控制）。
+   */
+  @Builder
+  OthersSection() {
+    Column() {
+      Row() {
+        Text('其他设备')
+          .fontSize(12)
+          .fontColor(AppColors.TextSecondary)
+        Blank()
+        Text(`${this.otherDevices.length} 台`)
+          .fontSize(11)
+          .fontColor(AppColors.TextTertiary)
+      }
+      .width('100%')
+      .padding({ left: AppSpacing.Large, right: AppSpacing.Large })
+      .margin({ bottom: 6 })
+
+      Scroll() {
+        Row({ space: AppSpacing.Medium }) {
+          ForEach(this.otherDevices, (device: AccountDevice) => {
+            Column() {
+              Text(this.otherDeviceTypeLabel(device.device_type))
+                .fontSize(11)
+                .fontColor(AppColors.TextTertiary)
+              Text(device.device_name.length > 0 ? device.device_name : '未命名设备')
+                .fontSize(13)
+                .fontWeight(FontWeight.Medium)
+                .fontColor(AppColors.TextPrimary)
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+                .margin({ top: 4 })
+              Text(device.device_id === this.selfDeviceId ? '本机' : '已登录同一账号')
+                .fontSize(10)
+                .fontColor(AppColors.TextTertiary)
+                .margin({ top: 2 })
+            }
+            .width(122)
+            .height(78)
+            .padding({ left: 10, right: 10 })
+            .backgroundColor(AppColors.Surface)
+            .borderRadius(AppSizes.RadiusMedium)
+            .justifyContent(FlexAlign.Center)
+            .alignItems(HorizontalAlign.Start)
+          }, (device: AccountDevice) => device.device_id)
+        }
+        .padding({ left: AppSpacing.Large, right: AppSpacing.Large })
+        .width('100%')
+        .justifyContent(FlexAlign.Start)
+      }
+      .scrollable(ScrollDirection.Horizontal)
+      .scrollBar(BarState.Off)
+      .width('100%')
+      .align(Alignment.Start)
+    }
+    .width('100%')
+    .alignItems(HorizontalAlign.Start)
+    .margin({ bottom: 6 })
+  }
+
+  @Builder
+  ComputerList() {
+    Refresh({ refreshing: $$this.isRefreshing }) {
+      if (this.getGridColumns() > 1) {
+        // 横屏/宽屏：使用 Grid 布局
+        Grid() {
+          ForEach(this.viewModel.computers, (computer: ObservableComputer, index: number) => {
+            GridItem() {
+              ComputerCard({
+                computer: computer,
+                onlineTransitionVersion: computer.onlineTransitionVersion,
+                onTap: () => {
+                  // 已配对但离线：弹菜单（唤醒/删除等）；未配对的离线电脑：
+                  // 走配对引导（自动建组网后再配对一次）
+                  if (!computer.isOnline && computer.isPaired) {
+                    this.showComputerMenu(computer);
+                  } else {
+                    this.actions!.handleComputerTap(computer);
+                  }
+                },
+                onLongPress: () => this.showComputerMenu(computer),
+                onQuickStream: () => this.actions!.handleQuickStream(computer)
+              })
+            }
+          }, (computer: ObservableComputer) => computer.uuid)
+        }
+        .columnsTemplate(this.getGridColumns() === 3 ? '1fr 1fr 1fr' : '1fr 1fr')
+        .columnsGap(AppSpacing.Medium)
+        .rowsGap(AppSpacing.Medium)
+        .width('100%')
+        .padding({ left: AppSpacing.Large, right: AppSpacing.Large })
+        .scrollBar(BarState.Off)
+        .edgeEffect(EdgeEffect.Spring)
+      } else {
+        // 竖屏：使用 List 布局
+        List({ space: AppSpacing.Medium }) {
+          LazyForEach(this.computerDataSource, (computer: ObservableComputer, index: number) => {
+            ListItem() {
+              ComputerCard({
+                computer: computer,
+                onlineTransitionVersion: computer.onlineTransitionVersion,
+                onTap: () => {
+                  // 已配对但离线：弹菜单（唤醒/删除等）；未配对的离线电脑：
+                  // 走配对引导（自动建组网后再配对一次）
+                  if (!computer.isOnline && computer.isPaired) {
+                    this.showComputerMenu(computer);
+                  } else {
+                    this.actions!.handleComputerTap(computer);
+                  }
+                },
+                onLongPress: () => this.showComputerMenu(computer),
+                onQuickStream: () => this.actions!.handleQuickStream(computer)
+              })
+            }
+          }, (computer: ObservableComputer) => computer.uuid)
+        }
+        .width('100%')
+        .padding({ left: AppSpacing.Large, right: AppSpacing.Large })
+        .scrollBar(BarState.Off)
+        .edgeEffect(EdgeEffect.Spring)
+        .cachedCount(5)
+      }
+    }
+    .layoutWeight(1)
+    .onRefreshing(() => {
+      this.refreshComputers();
+    })
+  }
+
+  @Builder
+  BottomBar() {
+    Row() {
+      // 刷新按钮 - 重新轮询已知主机状态
+      Button({ type: ButtonType.Circle }) {
+        if (this.isScanning) {
+          LoadingProgress()
+            .width(22)
+            .height(22)
+            .color(AppColors.TextSecondary)
+        } else {
+          Image($r('app.media.ic_refresh'))
+            .width(22)
+            .height(22)
+            .fillColor(AppColors.TextSecondary)
+        }
+      }
+      .width(44)
+      .height(44)
+      .backgroundColor(0x1A000000)  // 与 SaveButton 保持一致的半透明背景
+      .enabled(!this.isScanning)
+      .onClick(() => this.refreshKnownHosts())
+
+      // 添加电脑 - 次要入口（账号自动发现上线前保留）
+      Button({ type: ButtonType.Circle }) {
+        Image($r('app.media.ic_add'))
+          .width(20)
+          .height(20)
+          .fillColor(AppColors.TextSecondary)
+      }
+      .width(44)
+      .height(44)
+      .backgroundColor(0x1A000000)
+      .margin({ left: AppSpacing.Medium })
+      .onClick(() => AppNav.push('AddPcPageV2'))
+
+      // 控制码连接 - 中央主按钮
+      Button({ type: ButtonType.Circle }) {
+        Image($r('app.media.ic_key'))
+          .width(26)
+          .height(26)
+          .fillColor(Color.White)
+      }
+      .width(56)
+      .height(56)
+      .backgroundColor(AppColors.Primary)
+      .shadow({
+        radius: 12,
+        color: AppColors.PrimaryGlow,
+        offsetX: 0,
+        offsetY: 4
+      })
+      .margin({ left: AppSpacing.Medium, right: AppSpacing.Medium })
+      .onClick(() => this.startAccessCodeFlow())
+
+      // 下载壁纸到相册 - 使用 SaveButton 安全控件
+      // 注意：SaveButton 作为安全控件，背景色透明度有最低限制 (α >= 0x1A)
+      SaveButton({
+        icon: SaveIconStyle.FULL_FILLED,
+        buttonType: ButtonType.Circle
+      })
+        .width(44)
+        .height(44)
+        .iconSize(22)
+        .iconColor(AppColors.TextSecondary)
+        .backgroundColor(0x1A000000)  // 最低透明度的黑色背景
+        .onClick(this.handleSaveWallpaperClick)
+    }
+    .width('100%')
+    .justifyContent(FlexAlign.Center)
+    .alignItems(VerticalAlign.Center)
+    .padding({
+      left: AppSpacing.Large,
+      right: AppSpacing.Large,
+      top: AppSpacing.Small,
+      bottom: AppSpacing.Medium
+    })
+  }
+
+  // 刷新壁纸（获取新的随机图片）- 由摇一摇触发
+  private async refreshWallpaper(): Promise<void> {
+    try {
+      ToastQueue.show({ message: '正在刷新壁纸...' });
+      const localPath = await this.backgroundUtil.downloadToLocalCache(true); // forceRefresh = true
+      if (localPath) {
+        // 添加时间戳参数强制 Image 组件重新加载（绕过缓存）
+        this.backgroundImageUrl = 'file://' + localPath + '?t=' + Date.now();
+        ToastQueue.show({ message: '壁纸已刷新' });
+      } else {
+        ToastQueue.show({ message: '刷新失败' });
+      }
+    } catch (err) {
+      ToastQueue.show({ message: '刷新壁纸失败' });
+    }
+  }
+
+  /**
+   * SaveButton 保存壁纸点击回调
+   * 使用安全控件授权后保存图片到相册
+   */
+  handleSaveWallpaperClick: SaveButtonCallback = async (
+    event: ClickEvent,
+    result: SaveButtonOnClickResult,
+    error?: BusinessError
+  ) => {
+    if (result === SaveButtonOnClickResult.SUCCESS) {
+      const localPath = this.backgroundUtil.getLocalCachePath();
+      if (!localPath) {
+        ToastQueue.show({ message: '没有可下载的壁纸' });
+        return;
+      }
+
+      try {
+        const context = getContext(this) as common.UIAbilityContext;
+        ToastQueue.show({ message: '正在保存壁纸...' });
+
+        // 读取本地缓存文件
+        const stat = fileIo.statSync(localPath);
+        if (!stat || stat.size === 0) {
+          ToastQueue.show({ message: '缓存图片不存在' });
+          return;
+        }
+
+        const file = fileIo.openSync(localPath, fileIo.OpenMode.READ_ONLY);
+        const imageData = new ArrayBuffer(stat.size);
+        fileIo.readSync(file.fd, imageData);
+        fileIo.closeSync(file.fd);
+
+        // 使用 SaveButton 授权后创建图片资源
+        const helper = photoAccessHelper.getPhotoAccessHelper(context);
+        const uri = await helper.createAsset(photoAccessHelper.PhotoType.IMAGE, 'jpg');
+
+        // 写入图片数据
+        const photoFile = await fileIo.open(uri, fileIo.OpenMode.READ_WRITE | fileIo.OpenMode.CREATE);
+        await fileIo.write(photoFile.fd, imageData);
+        await fileIo.close(photoFile.fd);
+
+        ToastQueue.show({ message: '壁纸已保存到相册' });
+      } catch (err) {
+        Logger.error('PcListPageV2', '下载壁纸失败', err);
+        const e = err as BusinessError;
+        ToastQueue.show({ message: `保存失败: ${e.message || '未知错误'}` });
+      }
+    } else if (result === SaveButtonOnClickResult.TEMPORARY_AUTHORIZATION_FAILED) {
+      Logger.error('PcListPageV2', '保存授权失败', error);
+      ToastQueue.show({ message: '保存授权失败' });
+    }
+  };
+
+  // ==================== 业务逻辑 ====================
+
+  private async refreshComputers(): Promise<void> {
+    this.isRefreshing = true;
+    try {
+      await this.computerManager.refreshAllComputers();
+      this.syncViewModelFromManager();
+    } catch (err) {
+      Logger.error('PcListPageV2', '刷新失败', err);
+    } finally {
+      this.isRefreshing = false;
+    }
+  }
+
+  /** 扫码：自动识别配对 URL 或按键配置 */
+  private async scanAndImportKeys(): Promise<void> {
+    if (!QrShareService.isScanQrCodeSupported()) {
+      ToastQueue.show({
+        message: QrShareService.getScanUnsupportedMessage() + '，请使用刷新或手动添加',
+        duration: 2500
+      });
+      this.canScanQrCode = false;
+      return;
+    }
+
+    const result = await QrShareService.scanQrCode();
+    if (!result) {
+      ToastQueue.show({ message: '扫码取消或失败', duration: 1500 });
+      return;
+    }
+
+    // 检测 moonlight://pair URL（Sunshine QR 配对）
+    const trimmed = result.trim();
+    Logger.info('PcListPageV2', `[Scan] 扫码结果 (${trimmed.length}字符): ${trimmed.substring(0, 100)}`);
+    if (trimmed.startsWith('moonlight://pair')) {
+      await this.handleQrPairing(trimmed);
+      return;
+    }
+
+    const parsed = await QrShareService.deserialize(trimmed);
+    if (!parsed) {
+      ToastQueue.show({ message: '无法识别的二维码内容', duration: 2000 });
+      return;
+    }
+    const name = parsed[0];
+    const keys = parsed[1];
+    this.optionPickerDialogConfig = {
+      title: `导入配置: ${name}`,
+      subtitle: `包含 ${keys.length} 个按键`,
+      options: [
+        { title: '替换导入', value: 'replace' } as OptionItem,
+        { title: '合并导入', value: 'merge' } as OptionItem,
+      ],
+      selectedValue: '',
+      onSelect: async (option: OptionItem) => {
+        if (option.value === 'replace') {
+          await CustomKeyStore.saveKeys(keys);
+          ToastQueue.show({ message: `已导入 "${name}" (${keys.length} 个按键)`, duration: 2000 });
+        } else {
+          const existing = await CustomKeyStore.getKeys();
+          await CustomKeyStore.saveKeys(existing.concat(keys));
+          ToastQueue.show({ message: `已合并 ${keys.length} 个按键`, duration: 2000 });
+        }
+      }
+    };
+    this.optionPickerDialogController = new CustomDialogController({
+      builder: OptionPickerDialog({
+        config: this.optionPickerDialogConfig
+      }),
+      alignment: DialogAlignment.Bottom,
+      customStyle: true,
+      backgroundColor: Color.Transparent
+    });
+    this.optionPickerDialogController.open();
+  }
+
+  /** 处理 Sunshine QR 配对 URL */
+  private async handleQrPairing(url: string): Promise<void> {
+    // 解析 moonlight://pair?host=...&port=...&pin=...&name=...
+    const paramStr = url.substring(url.indexOf('?') + 1);
+    const params = new Map<string, string>();
+    for (const part of paramStr.split('&')) {
+      const eq = part.indexOf('=');
+      if (eq > 0) {
+        params.set(part.substring(0, eq), decodeURIComponent(part.substring(eq + 1)));
+      }
+    }
+
+    const host = params.get('host') ?? '';
+    const portStr = params.get('port') ?? '';
+    const pin = params.get('pin') ?? '';
+    const serverName = params.get('name') ?? host;
+
+    if (!host || !pin) {
+      ToastQueue.show({ message: '二维码缺少必要信息', duration: 2000 });
+      return;
+    }
+
+    const address = portStr ? `${host}:${portStr}` : host;
+    ToastQueue.show({ message: `正在连接 ${serverName}...`, duration: 2000 });
+
+    try {
+      // 1. 添加电脑
+      const computer = await this.computerManager.addComputer(address);
+      this.syncViewModelFromManager();
+
+      if (computer.pairState === PairState.PAIRED) {
+        ToastQueue.show({ message: `${serverName} 已配对`, duration: 2000 });
+        return;
+      }
+
+      // 2. 使用 QR 码中的 PIN 自动配对（服务端已 preset，无需用户输入）
+      ToastQueue.show({ message: `正在与 ${serverName} 配对...`, duration: 2000 });
+      const context = getContext() as common.UIAbilityContext;
+      const pairingManager = new PairingManager(
+        selectBestAddress(computer), computer.uuid, context, computer.httpPort
+      );
+      const result = await pairingManager.pair(pin);
+
+      if (result.state === PMPairState.PAIRED) {
+        let serverCertBase64 = '';
+        if (result.serverCert) {
+          serverCertBase64 = buffer.from(result.serverCert).toString('base64');
+        }
+        await this.computerManager.updateComputer(computer.uuid, {
+          pairState: PairState.PAIRED,
+          serverCert: serverCertBase64,
+          pairName: result.pairName || ''
+        });
+        this.syncViewModelFromManager();
+        ToastQueue.show({ message: `已成功配对 ${serverName}！` });
+        AppNav.push('AppListPageV2', { computerId: computer.uuid } as AppListPageParams);
+      } else if (result.state === PMPairState.PIN_WRONG) {
+        ToastQueue.show({ message: '二维码已过期，请在 Sunshine 重新生成', duration: 3000 });
+      } else if (result.state === PMPairState.ALREADY_IN_PROGRESS) {
+        ToastQueue.show({ message: '另一个设备正在配对中', duration: 2000 });
+      } else {
+        ToastQueue.show({ message: `配对失败: ${result.state}`, duration: 2000 });
+      }
+    } catch (error) {
+      ToastQueue.show({ message: `连接失败: ${(error as Error).message}`, duration: 3000 });
+    }
+  }
+
+  /**
+   * 手动刷新：重新轮询所有已知主机的在线状态（不发起 mDNS 发现）。
+   * 局域网内的新主机由 startBackgroundScan 持续自动发现；
+   * 这里若改调 mdnsDiscovery.discover() 会反过来 stopDiscovery() 把后台扫描杀掉
+   * （见 MdnsDiscovery.discover 的实现），因此按钮只做状态刷新。
+   */
+  private async refreshKnownHosts(): Promise<void> {
+    if (this.isScanning) {
+      return;
+    }
+
+    this.isScanning = true;
+    try {
+      await this.computerManager.refreshAllComputers();
+      this.syncViewModelFromManager();
+      ToastQueue.show({ message: '刷新完成' });
+    } catch (err) {
+      Logger.error('PcListPageV2', '刷新失败', err);
+      ToastQueue.show({ message: '刷新失败' });
+    } finally {
+      this.isScanning = false;
+    }
+  }
+
+  private showComputerMenu(computer: ObservableComputer): void {
+    // 使用 ComputerMenuHelper 生成菜单
+    const callbacks: ComputerMenuCallbacks = {
+      onWake: (c) => this.actions!.wakeComputer(c),
+      onPair: (c) => this.actions!.pairWithComputer(c),
+      onResumeGame: (c) => this.actions!.resumeGame(c),
+      onQuitGame: (c) => this.actions!.quitGame(c),
+      onAppList: (c) => AppNav.push('AppListPageV2', { computerId: c.uuid } as AppListPageParams),
+      onHostWebUi: (c) => AppNav.push('HostWebUiPage', { computerId: c.uuid } as HostWebUiPageParams),
+      onUnpair: (c) => this.actions!.unpairComputer(c),
+      onSleep: (c) => this.actions!.sleepComputer(c),
+      onTestNetwork: (c) => this.actions!.testNetwork(c),
+      onShowDetails: (c) => this.actions!.showComputerDetails(c),
+      onDelete: (c) => this.actions!.deleteComputer(c)
+    };
+
+    const menuResult = ComputerMenuHelper.generateMenu(computer, callbacks);
+
+    // 设置配置
+    this.optionPickerDialogConfig = {
+      title: computer.name,
+      subtitle: computer.statusText,
+      options: menuResult.options,
+      selectedValue: '',
+      onSelect: (option: OptionItem) => {
+        const action = menuResult.actionMap.get(option.value as string);
+        if (action) {
+          action();
+        }
+      }
+    };
+
+    // 创建并打开弹窗
+    this.optionPickerDialogController = new CustomDialogController({
+      builder: OptionPickerDialog({
+        config: this.optionPickerDialogConfig
+      }),
+      alignment: DialogAlignment.Bottom,
+      customStyle: true,
+      backgroundColor: Color.Transparent
+    });
+    this.optionPickerDialogController.open();
+  }
+}
+
+
+@Builder
+export function PcListPageV2Builder() {
+  PcListPageV2()
+}

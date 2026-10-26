@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240" width="240" height="240" fill="none" role="img" aria-label="这次很好">
+  <title>串流报告 · 很好</title>
+  <desc>一条持续上升的折线，终点是点亮的实心火种，外围一圈淡淡的光。上升的走势就是情绪本身。</desc>
+  <path d="M44 158 L88 112 L128 128 L172 76 L204 50" stroke="#26A67C" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="204" cy="50" r="34" stroke="#26A67C" stroke-width="3" opacity="0.32"/>
+  <circle cx="204" cy="50" r="20" fill="#26A67C"/>
+</svg>

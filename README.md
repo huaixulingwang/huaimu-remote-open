@@ -1,2 +1,53 @@
-# huaimu-remote-open
-槐木远控 · 开源库（HarmonyOS 平板端）
+# OpenRemoteDesk · 鸿蒙平板端（开源库）
+
+把 HarmonyOS 平板当作远程桌面 / 游戏串流的控制端。
+
+> **非官方衍生版本说明**
+> 本仓库基于 [AlkaidLab/moonlight-harmony](https://github.com/AlkaidLab/moonlight-harmony)（GPL-3.0）修改而来，**不是**该项目的官方版本，与原作者的官方发行版无关。
+> 上游又基于 [qiin2333/moonlight-vplus](https://github.com/qiin2333/moonlight-vplus)（GPL-3.0）与 [moonlight-common-c](https://github.com/moonlight-stream/moonlight-common-c)（GPL-3.0）。
+> 原作者的版权与许可声明全部保留，详见 [NOTICE](NOTICE) 与 [LICENSE](LICENSE)。
+
+> 本仓库由作者私有库导出，外观与官方发行版不同（名称、图标、启动页文案等品牌素材不在开源范围内，详见 [TRADEMARK.md](TRADEMARK.md)）。
+
+## 功能
+
+- 远程操作 Windows 桌面，支持触控、虚拟手柄、蓝牙键盘
+- 内置 EasyTier 组网，打开软件自动打通，无需外部组网 App
+- 隐私屏、虚拟显示器、多屏选择、分辨率跟随平板
+- 同一账号设备免配对；不同账号用 6 位控制码临时接入
+- 串流结束给出网络 / 解码 / 主机三段延迟提示（可在设置里开关）
+
+## 快速开始
+
+1. 电脑端装好被控端（见电脑端仓库），并配好会合节点
+2. 用 DevEco Studio 打开本工程，按 [BUILD.md](BUILD.md) 配置签名后构建安装
+3. 平板与电脑登录同一账号，或由电脑端生成 6 位控制码
+4. 打开 App，点电脑卡片连接
+
+> 本仓库里的服务器地址、云环境号都是占位符，**第一次跑之前请先看 [CONFIG.md](CONFIG.md)**。
+
+## 目录
+
+| 目录 | 作用 |
+|---|---|
+| `entry/` | 应用主体（页面、服务、界面组件） |
+| `nativelib/` | 原生串流库（含子模块 moonlight-common-c、ohos-openssl） |
+| `AppScope/` | 应用级配置与资源 |
+| `docs/` | 内部文档（公开库不含） |
+
+## 使用声明
+
+本项目仅用于合法场景下的自有设备远程访问与技术研究。严禁用于未经授权的设备控制、窥探他人隐私或任何违法用途；使用者应自行确保对所控制的设备拥有合法权限，并自行承担因使用不当产生的一切后果。
+
+本项目由 AI 综合性辅助完成，虽经反复测试，仍难免存在遗漏或不足；如发现错误，欢迎指出。
+
+本项目涉及第三方开源组件，均已在 [NOTICE](NOTICE) 文件中列明来源与许可。若相关权利人认为本项目存在侵权内容，请联系作者，我们会在核实后及时处理（删除、替换或补充授权）。
+
+作者并非 IT 专业人员，代码中是否残留高风险实现，请使用者在部署前自行评估与审阅。
+
+欢迎各位前辈、大佬指正与贡献。
+
+## 许可
+
+本仓库自有改动依 [AGPL-3.0](LICENSE) 授权；上游 GPL-3.0 部分仍按 GPL-3.0，合并作品整体按 AGPL-3.0 分发（依据 GPLv3 第 13 条）。
+「槐木远控」名称、图标、启动页文案、组织口号及相关视觉素材不在授权范围内，见 [TRADEMARK.md](TRADEMARK.md)。

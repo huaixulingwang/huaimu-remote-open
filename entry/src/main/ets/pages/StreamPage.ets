@@ -1,0 +1,3106 @@
+/*
+ * Moonlight for HarmonyOS
+ * Copyright (C) 2024-2025 Moonlight/AlkaidLab
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ */
+
+/**
+ * 串流页面
+ * 
+ * 显示远程游戏画面并处理用户输入
+ */
+import { LengthMetrics } from '@kit.ArkUI';
+import { AppNav } from '../common/AppNav';
+import { StreamPageParams } from '../common/PageParams';
+import { display } from '@kit.ArkUI';
+import { getDisplayRequestHz } from '../utils/DisplayFrameRate';
+import { promptAction } from '@kit.ArkUI';
+import { common, abilityAccessCtrl, bundleManager, Permissions } from '@kit.AbilityKit';
+import { displaySync } from '@kit.ArkGraphics2D';
+import { VirtualControllerOverlay } from '../components/virtual/VirtualController';
+import { PerformanceOverlay } from '../components/PerformanceOverlay';
+import { OptionPickerDialog, OptionPickerDialogConfig } from '../components/dialogs/OptionPickerDialog';
+import { GameMenuDialog, GameMenuCallbacks } from '../components/dialogs/GameMenuDialog';
+import { StreamMenuManager } from '../components/StreamMenuManager';
+import { StreamViewModel, TouchMode } from '../viewmodel/StreamViewModel';
+import { TouchInputHandler, TouchInputMode } from '../service/input/TouchInputHandler';
+import {
+  DS5_TOUCH_FEEDBACK_CANCEL,
+  DS5_TOUCH_FEEDBACK_CLICK_DOWN,
+  DS5_TOUCH_FEEDBACK_CLICK_UP,
+  DS5_TOUCH_FEEDBACK_DOWN,
+  DS5_TOUCH_FEEDBACK_MOVE,
+  DS5_TOUCH_FEEDBACK_UP,
+  Ds5TouchpadFeedback
+} from '../service/input/Ds5TouchpadGestureHandler';
+import { StreamWindowManager, DisplaySize } from '../service/streaming/StreamWindowManager';
+import { ShortcutManager, Shortcut } from '../components/ShortcutManager';
+import { pickRandomConnectingTip } from '../components/StreamConnectingTips';
+import { ShortcutEditorDialog, ShortcutEditData } from '../components/dialogs/ShortcutEditorDialog';
+import { GamepadManager, GamepadState, MoonlightControllerType, MouseEmulationCallback } from '../service/input/GamepadManager';
+import { GyroAssistService } from '../service/input/GyroAssistService';
+import { MoonBridge, BUTTON_ACTION_PRESS, BUTTON_ACTION_RELEASE } from '../service/streaming/MoonBridge';
+import { SuperCmd, NvHttp } from '../service/streaming/NvHttp';
+import { VirtualKey, KeyAction, sendShortcutKeys } from '../service/customkey/CustomKeyTypes';
+import { pointer } from '@kit.InputKit';
+import { InputInterceptorService } from '../service/input/InputInterceptorService';
+import { PreferencesUtil } from '../utils/PreferencesUtil';
+import { VpnController, HOST_VIRTUAL_IP } from '../service/networking/VpnController';
+import { AccessGate } from '../service/network/AccessGate';
+import { AccountCenterService } from '../service/account/AccountCenterService';
+import { selectBestAddress } from '../model/ComputerInfo';
+import { FileLog } from '../service/networking/FileLog';
+import { SettingsKeys } from '../service/SettingsService';
+import { AihdrModifier, isAihdrSupported } from '../components/AihdrModifier';
+import { StreamInputHandler } from '../service/streaming/StreamInputHandler';
+import { StreamLifecycleManager } from '../service/streaming/StreamLifecycleManager';
+import { StreamIMEManager } from '../service/streaming/StreamIMEManager';
+import { VirtualKeyboard } from '../components/virtual/VirtualKeyboard';
+import { CustomKeyOverlay } from '../components/CustomKeyOverlay';
+import { StreamSessionReport, StreamReportData, StreamReportStats, StreamReportConfigSnapshot, createEmptyStreamReport, createStreamReportConfigSnapshot, buildStreamReportDataFromSnapshot, buildStreamDiagnosticsText, markStreamReportAiLoading } from '../components/StreamSessionReport';
+import { CustomKeyManager, CustomKeyManagerHost, SessionLike } from '../service/customkey/CustomKeyManager';
+import { CustomKeyStore } from '../service/customkey/CustomKeyStore';
+import { PanZoomHandler, PanZoomState, PointXY } from '../service/input/PanZoomHandler';
+import { AiKeyService, AiKeyRecommendation } from '../service/AiKeyService';
+import { StreamReportAiService } from '../service/StreamReportAiService';
+import { ComputerManager } from '../service/ComputerManager';
+import { ToastQueue } from '../utils/ToastQueue';
+import { NetworkBoostService, SystemNetScene, SystemNetSceneListener } from '../service/network/NetworkBoostService';
+import { ClipboardSyncObserver, ClipboardSyncService } from '../service/clipboard/ClipboardSyncService';
+import { ClipboardSyncConfig } from '../service/clipboard/ClipboardSyncConfig';
+import { SunshineClipboardBlobTransport } from '../service/clipboard/SunshineClipboardBlobTransport';
+import { ThreeFingerImeGestureHandler, ThreeFingerImeGestureResult } from '../service/input/ThreeFingerImeGestureHandler';
+import { Logger } from '../common/Logger';
+
+/** MouseEmulationCallback 的具体实现，桥接 MoonBridge 鼠标 API */
+class MoonBridgeMouseCallback implements MouseEmulationCallback {
+  sendMouseMove(deltaX: number, deltaY: number): void {
+    MoonBridge.sendMouseMove(deltaX, deltaY);
+  }
+  sendMouseButtonDown(button: number): void {
+    MoonBridge.sendMouseButton(BUTTON_ACTION_PRESS, button);
+  }
+  sendMouseButtonUp(button: number): void {
+    MoonBridge.sendMouseButton(BUTTON_ACTION_RELEASE, button);
+  }
+  sendMouseHighResScroll(scrollAmount: number): void {
+    MoonBridge.sendMouseHighResScroll(scrollAmount);
+  }
+  sendMouseHighResHScroll(scrollAmount: number): void {
+    MoonBridge.sendMouseHighResHScroll(scrollAmount);
+  }
+}
+
+class StreamClipboardObserver implements ClipboardSyncObserver {
+  onError(error: string): void {
+    ToastQueue.show({ message: `剪贴板同步错误: ${error}`, duration: 2000 });
+  }
+}
+
+
+interface Ds5TouchIndicator {
+  pointerId: number;
+  x: number;
+  y: number;
+  contactActive: boolean;
+  clickPressed: boolean;
+  opacity: number;
+  scale: number;
+}
+
+class BuiltStreamReport {
+  data: StreamReportData = createEmptyStreamReport();
+  stats: StreamReportStats = new StreamReportStats();
+  config: StreamReportConfigSnapshot | null = null;
+  durationMs: number = 0;
+  diagnosticsText: string = '';
+}
+
+/** StreamPage 对 CustomKeyManager 的宿主回调实现 */
+class CustomKeyManagerHostImpl implements CustomKeyManagerHost {
+  getSessionFn: () => SessionLike | null = () => null;
+  toggleVirtualKeyboardFn: () => void = () => {};
+  showIMEFn: () => void = () => {};
+  openGameMenuFn: () => void = () => {};
+  toggleMouseModeFn: () => void = () => {};
+  switchProfileFn: () => void = () => {};
+  toggleEditModeFn: () => void = () => {};
+  hideCustomKeysFn: () => void = () => {};
+  onCustomKeysImportedFn: () => void = () => {};
+
+  getSession(): SessionLike | null {
+    return this.getSessionFn();
+  }
+
+  toggleVirtualKeyboard(): void {
+    this.toggleVirtualKeyboardFn();
+  }
+
+  showIME(): void {
+    this.showIMEFn();
+  }
+
+  openGameMenu(): void {
+    this.openGameMenuFn();
+  }
+
+  toggleMouseMode(): void {
+    this.toggleMouseModeFn();
+  }
+
+  switchProfile(): void {
+    this.switchProfileFn();
+  }
+
+  toggleEditMode(): void {
+    this.toggleEditModeFn();
+  }
+
+  hideCustomKeys(): void {
+    this.hideCustomKeysFn();
+  }
+
+  onCustomKeysImported(): void {
+    this.onCustomKeysImportedFn();
+  }
+}
+
+@Component
+struct StreamPage {
+  // ViewModel
+  @State viewModel: StreamViewModel = new StreamViewModel();
+  
+  // 网络质量警告（通过 AppStorage 跨 NAPI 边界可靠同步）
+  @StorageLink('connectionPoor') connectionPoor: boolean = false;
+
+  // 连接中遮罩使用的应用海报（由 AppListPageV2 传入），让等待 launchApp/首帧时不再是纯黑屏
+  @State posterPath: string = '';
+  // 全局底商：PcView 加载的背景壁纸。posterPath 为空时（从 PcCard 直接串流）底到这里
+  @StorageLink('globalBackgroundImageUrl') globalBgUrl: string = '';
+  // 连接中遮罩随机展示的小课堂提示
+  @State connectingTip: string = '';
+  
+  // UI 状态
+  @State xComponentWidth: Length = '100%';
+  @State xComponentHeight: Length = '100%';
+  @State xComponentAlignment: Alignment = Alignment.Center;  // 画面位置（9 宫格）
+  @State xComponentOffsetX: number = 0;  // 画面水平偏移 (vp)
+  @State xComponentOffsetY: number = 0;  // 画面垂直偏移 (vp)
+  @State showKeyboardPanel: boolean = false;  // 系统键盘输入面板
+  /** IME bar 锁定状态：锁定后点击串流画面不会收起 IME / IME bar */
+  @State imePanelLocked: boolean = false;
+  @State keyboardHeight: number = 0;  // IME 键盘高度 (vp)
+  @State showVirtualKeyboard: boolean = false;  // PC 虚拟键盘
+  @State showCustomKeys: boolean = false;  // 自定义按键覆盖层
+  @State customKeyEditMode: boolean = false;  // 自定义按键编辑模式
+  @State customKeyProfileVersion: number = 0;  // 配置切换信号（递增触发 Overlay 重载）
+  /**
+   * 自定义按键命中测试刷新触发器。
+   * ArkUI 首次渲染时 .position() 子组件的命中测试区域可能未正确建立，
+   * 通过在父层触发一次重渲染来刷新命中测试树（参见 ARKUI_TOUCH_HANDLING_LESSONS.md）。
+   */
+  @State private customKeyHitReady: number = 0;
+  /** 串流结束后的可分享战报 */
+  @State private showStreamReport: boolean = false;
+  @State private streamReportData: StreamReportData = createEmptyStreamReport();
+  @State private streamDiagnosticsText: string = '';
+  /** 用户设置：优先使用虚拟键盘 */
+  private useVirtualKeyboard: boolean = false;
+  /** 待对话框关闭后显示 IME */
+  private pendingShowIME: boolean = false;
+  /** 虚拟手柄+触摸共存 */
+  @State touchPassthrough: boolean = false;
+  /** 虚拟手柄缩放比例 */
+  @State controllerScaleValue: number = 1.0;
+  /** 虚拟手柄透明度 */
+  @State controllerOpacityValue: number = 0.75;
+  /** 双指缩放模式开关（启用后触摸用于缩放/平移，不发送给远端） */
+  @State isTouchOverrideEnabled: boolean = false;
+  /** 视频缩放倍数 */
+  @State videoScale: number = 1.0;
+  /** 视频水平平移 (vp) */
+  @State videoTranslateX: number = 0;
+  /** 视频垂直平移 (vp) */
+  @State videoTranslateY: number = 0;
+  /** DS5 触控板本地触点回显，短暂显示且不参与命中测试。 */
+  @State private ds5TouchIndicators: Ds5TouchIndicator[] = [];
+
+  // 鼠标高帧率保持（C++ Monitor 不可用时的 fallback）
+  // 使用 DisplaySync 直接向系统合成器请求高刷新率，
+  // 解决无触摸时 ArkUI .onMouse 降至 ~30Hz 的问题
+  private mouseDisplaySync: displaySync.DisplaySync | null = null;
+  private streamDisplaySync: displaySync.DisplaySync | null = null;
+  private streamFrameDiagnosticTimer: number | null = null;
+  // 黑匣子：主界面心跳定时器（每 2 秒落一次时间戳，卡死时定位冻结时刻）
+  private uiHeartbeatTimer: number | null = null;
+  private streamDisplayCallbacks: number = 0;
+  private xComponentFrameRequestActive: boolean = false;
+  private mouseInputSuspended: boolean = false;
+  
+  // ── 解耦的处理器/管理器 ──
+  private inputHandler: StreamInputHandler = new StreamInputHandler();
+  private lifecycleManager: StreamLifecycleManager = new StreamLifecycleManager();
+  private imeManager: StreamIMEManager = new StreamIMEManager(getContext(this) as common.UIAbilityContext);
+  private clipboardSyncService: ClipboardSyncService | null = null;
+  
+  // 对话框控制器
+  private gameMenuDialogController: CustomDialogController | null = null;
+  private shortcutEditorController: CustomDialogController | null = null;
+  private optionPickerDialogController: CustomDialogController | null = null;
+  private optionPickerDialogConfig: OptionPickerDialogConfig = {
+    title: '',
+    options: [],
+    onSelect: () => {}
+  };
+  
+  // XComponent 实际渲染尺寸缓存（由 onAreaChange 回调更新）
+  // 窗口模式下 xComponentWidth/Height='100%'，实际 vp 尺寸需从 onAreaChange 获取
+  private xComponentActualWidthVp: number = 0;
+  private xComponentActualHeightVp: number = 0;
+  private videoViewportWidthVp: number = 0;
+  private videoViewportHeightVp: number = 0;
+
+  // 组件控制器和服务
+  private xComponentController: XComponentController = new XComponentController();
+  @State aihdrModifier: AihdrModifier = new AihdrModifier();
+  private context: common.UIAbilityContext = getContext(this) as common.UIAbilityContext;
+  private touchInputHandler: TouchInputHandler = new TouchInputHandler();
+  private windowManager: StreamWindowManager | null = null;
+  private menuManager: StreamMenuManager | null = null;
+  private shortcutManager: ShortcutManager = ShortcutManager.getInstance();
+  private gamepadManager: GamepadManager = GamepadManager.getInstance();
+  private customKeyManager: CustomKeyManager | null = null;
+  private panZoomHandler: PanZoomHandler = new PanZoomHandler();
+  private threeFingerImeGestureHandler: ThreeFingerImeGestureHandler = new ThreeFingerImeGestureHandler();
+  private controllerTypes: Map<number, number> = new Map();  // slot → MoonlightControllerType
+  private aiKeyService: AiKeyService | null = null;
+  private aiKeyNvHttp: NvHttp | null = null;
+  private streamReportAiService: StreamReportAiService | null = null;
+  private streamReportAiRequestId: number = 0;
+  // AI 可用性探测的延时定时器，aboutToDisappear 时需清理
+  private aiProbeTimer: number | null = null;
+  // 页面已销毁标志：startStreaming 异步链路在销毁后恢复时据此放弃启动，
+  // 防止已销毁页面重新产生高刷请求
+  private pageDisposed: boolean = false;
+  private ds5TouchFadeTimers: Map<number, number> = new Map();
+  
+  // 页面参数
+  private computerId: string = '';
+  private appId: number = 0;
+  private appName: string = '';
+  private displayGuid: string = '';
+  private useVdd: boolean = false;
+  private privacyScreenEnabled: boolean = false; // 全局隐私屏状态（菜单切换后以重连生效）
+  private cmdList: SuperCmd[] = [];  // 超级指令列表
+  private enableBackgroundTask: boolean = true;  // 后台保活开关
+  private endStreamReportEnabled: boolean = false;  // 结束串流显示数据/战报开关
+  private streamStartedAtMs: number = 0;  // 本次串流真正连上后的时间戳
+  private pendingStreamShutdown: Promise<void> | null = null;
+  private pendingStreamShutdownLabel: string = '';
+  private isClosingStreamReport: boolean = false;
+
+  // ── Network Boost 场景监听（弱信号/拥塞 提示） ──
+  private netSceneListener: SystemNetSceneListener | null = null;
+  private netSceneToastedAt: number = 0;
+  private netSceneLastKey: string = '';
+  
+  aboutToAppear(): void {
+    // 黑匣子：页面一出现就开始打心跳，主界面卡死时日志能给出精确的冻结时刻
+    this.startUiHeartbeat();
+    const params = AppNav.topParams<StreamPageParams>();
+    if (params) {
+      this.computerId = params.computerId;
+      this.appId = params.appId;
+      // 电脑端 apps.json 里内置桌面应用叫 Desktop，界面统一显示中文
+      this.appName = params.appName === 'Desktop' ? '桌面' : (params.appName || '');
+      this.displayGuid = params.displayGuid || '';
+      this.useVdd = params.useVdd || false;
+      this.loadPrivacyState();
+      // 连接中遮罩背景（应用海报），让等待首帧时有视觉锚点
+      this.posterPath = params.posterPath || '';
+      // 解析超级指令列表
+      if (params.cmdList) {
+        try {
+          this.cmdList = JSON.parse(params.cmdList) as SuperCmd[];
+        } catch {
+          this.cmdList = [];
+        }
+      }
+    }
+    // 每次进入随机选一条小课堂提示
+    this.connectingTip = pickRandomConnectingTip();
+
+    // 自动加载游戏关联的自定义按键配置
+    if (this.appId > 0) {
+      CustomKeyStore.loadGameProfile(this.appId).then((profile) => {
+        if (profile) {
+          this.customKeyProfileVersion++;
+          Logger.info('StreamPage', `[StreamPage] 自动加载游戏配置: ${profile.name}`);
+        }
+      });
+    }
+    
+    // 初始化 AI 按键推荐服务
+    // 注意：AI 探测的 HTTPS 请求会与串流启动链路抢带宽 / TLS handshake，因此这里只创建
+    // 服务实例，把可用性探测推迟到 startStreaming() 成功之后再触发（见 probeAiAvailable）。
+    if (this.computerId) {
+      try {
+        const computer = ComputerManager.getInstance().getComputer(this.computerId);
+        if (computer) {
+          const nvHttp = NvHttp.fromComputer(computer, this.context);
+          this.aiKeyService = new AiKeyService(nvHttp, this.context);
+          this.streamReportAiService = new StreamReportAiService(nvHttp);
+          this.aiKeyNvHttp = nvHttp;
+        }
+      } catch (err) {
+        Logger.warn('StreamPage', `[StreamPage] AI 服务初始化失败: ${err}`);
+      }
+    }
+
+    // 初始化窗口管理器
+    this.windowManager = new StreamWindowManager(this.context);
+    this.windowManager.setOnWindowSizeChanged(() => this.recalculateXComponentSize());
+    this.windowManager.setOnWindowFocusChanged((focused: boolean) => {
+      if (!this.viewModel.isConnected) return;
+      if (!focused) {
+        // 失焦（Alt+Tab 切走 / 弹系统对话框）：释放所有按键，
+        // 防止 KEY_UP 丢失导致主机端修饰键/普通键卡住
+        this.inputHandler.releaseAllKeys();
+        this.touchInputHandler.cancelActiveInput();
+        this.inputHandler.stopMouseInterceptor();
+        this.stopMouseKeepAlive();
+      } else {
+        // 焦点恢复：对账仍被物理按住的按键（补发差量事件），再恢复鼠标
+        this.inputHandler.reconcileKeyState();
+        if (!this.mouseInputSuspended) {
+          this.resumeMouseInterceptor();
+        }
+      }
+    });
+
+    // 注册 Network Boost 网络场景监听（弱信号/拥塞 提示）
+    this.netSceneListener = (scene: SystemNetScene): void => {
+      this.handleNetworkScene(scene);
+    };
+    NetworkBoostService.getInstance().addSceneListener(this.netSceneListener);
+    
+    // 初始化快捷键管理器
+    this.shortcutManager.initialize(this.context);
+    
+    // 初始化菜单管理器
+    this.menuManager = new StreamMenuManager(this.viewModel, {
+      onResume: () => {
+        // 继续游戏 - 不做任何事情
+      },
+      onDisconnect: () => {
+        this.stopStreaming();
+      },
+      onQuitGame: () => {
+        this.quitGameAndReturn();
+      },
+      onTouchModeChanged: (mode: string) => {
+        this.setTouchMode(mode);
+      },
+      onShowTouchModeMenu: () => {
+        setTimeout(() => {
+          this.showTouchModeMenu();
+        }, 100);
+      }
+    });
+    
+    // 初始化手柄管理器
+    this.initializeGamepad();
+
+    // 初始化自定义按键管理器
+    const customKeyHost = new CustomKeyManagerHostImpl();
+    customKeyHost.getSessionFn = (): SessionLike | null => this.viewModel.getSession();
+    customKeyHost.toggleVirtualKeyboardFn = (): void => {
+      if (this.useVirtualKeyboard) {
+        this.showVirtualKeyboard = !this.showVirtualKeyboard;
+      } else {
+        this.imeManager.show();
+      }
+    };
+    customKeyHost.showIMEFn = (): void => { this.imeManager.show(); };
+    customKeyHost.openGameMenuFn = (): void => { this.showStreamMenu(); };
+    customKeyHost.toggleMouseModeFn = (): void => {
+      // 切换鼠标模式（复用菜单管理器提供的触摸模式切换）
+      this.showTouchModeMenu();
+    };
+    customKeyHost.switchProfileFn = (): void => {
+      this.cycleCustomKeyProfile();
+    };
+    customKeyHost.toggleEditModeFn = (): void => {
+      this.customKeyEditMode = !this.customKeyEditMode;
+    };
+    customKeyHost.hideCustomKeysFn = (): void => {
+      this.showCustomKeys = false;
+    };
+    customKeyHost.onCustomKeysImportedFn = (): void => { this.showCustomKeys = true; };
+    this.customKeyManager = new CustomKeyManager(customKeyHost);
+    
+    // 初始化输入处理器
+    this.inputHandler.initialize(this.viewModel, this.gamepadManager);
+    this.inputHandler.setOnShowStreamMenu(() => this.showStreamMenu());
+
+    // 初始化双指缩放处理器
+    this.panZoomHandler.setOnStateChanged((state: PanZoomState) => {
+      this.videoScale = state.scale;
+      this.videoTranslateX = state.translateX;
+      this.videoTranslateY = state.translateY;
+      // 缩放状态下设置坐标逆变换，确保触摸坐标映射到正确的游戏画面位置
+      if (this.panZoomHandler.isZoomed()) {
+        this.touchInputHandler.setCoordinateTransform((x: number, y: number): PointXY => {
+          return this.panZoomHandler.inverseTransform(x, y);
+        });
+      } else {
+        this.touchInputHandler.setCoordinateTransform(null);
+      }
+    });
+    
+    // 初始化生命周期管理器
+    this.lifecycleManager.initialize(this.viewModel, this.windowManager, {
+      updateXComponentSize: (width: Length, height: Length) => {
+        this.xComponentWidth = width;
+        this.xComponentHeight = height;
+      },
+      updatePanZoomParentSize: (width: number, height: number) => {
+        this.panZoomHandler.setParentSize(width, height);
+      },
+      stopStreaming: () => {
+        this.stopStreaming();
+      },
+      reconnectStreaming: () => {
+        this.reconnectStreaming();
+      },
+      releaseAllKeys: () => {
+        this.inputHandler.releaseAllKeys();
+      },
+      reconcileKeyState: () => {
+        this.inputHandler.reconcileKeyState();
+      }
+    });
+    
+    // 初始化 IME 管理器
+    this.imeManager.initialize(this.viewModel, {
+      onKeyboardVisibilityChanged: (visible: boolean) => {
+        this.showKeyboardPanel = visible;
+        // IME 真正关闭时同步释放锁定状态
+        if (!visible) {
+          this.imePanelLocked = false;
+        }
+      },
+      onKeyboardHeightChanged: (height: number) => {
+        this.keyboardHeight = height;
+      }
+    });
+    
+    // 获取屏幕尺寸
+    this.initializeDisplay();
+    
+    // 注册应用状态监听
+    this.lifecycleManager.registerAppStateListener();
+    
+    // 注册屏幕方向变化监听
+    this.lifecycleManager.registerDisplayChangeListener();
+  }
+    /**
+   * 初始化手柄输入
+   */
+  private initializeGamepad(): void {
+    this.gamepadManager.setListener({
+      onGamepadConnected: (deviceId: number, name: string, controllerType: number) => {
+        Logger.info('StreamPage', `手柄已连接: ${name} (ID: ${deviceId}, Type: ${controllerType})`);
+        this.controllerTypes.set(deviceId, controllerType);
+        ToastQueue.show({ message: `手柄已连接: ${name}` });
+      },
+      onGamepadDisconnected: (deviceId: number) => {
+        Logger.info('StreamPage', `手柄已断开: ID ${deviceId}`);
+        this.controllerTypes.delete(deviceId);
+        ToastQueue.show({ message: '手柄已断开' });
+      },
+      onGamepadInput: (deviceId: number, state: GamepadState) => {
+        this.handleGamepadInput(deviceId, state);
+      },
+      onGamepadCapabilitiesChanged: (slotId: number, controllerType: number) => {
+        this.controllerTypes.set(slotId, controllerType);
+        this.viewModel.refreshGamepadCapabilities(slotId, controllerType);
+      }
+    });
+
+    // 设置鼠标模拟回调 — 手柄摇杆→鼠标移动/按键→鼠标按键
+    this.gamepadManager.setMouseEmulationCallback(new MoonBridgeMouseCallback());
+
+    // 设置触摸板鼠标回调 — DualSense/DS4 触摸板→鼠标移动
+    this.gamepadManager.setTouchpadMouseCallback((deltaX: number, deltaY: number) => {
+      MoonBridge.sendMouseMove(deltaX, deltaY);
+    });
+
+    // 设置长按 Start 显示菜单的回调
+    this.gamepadManager.setShowGameMenuCallback(() => {
+      this.showStreamMenu();
+    });
+  }
+  
+  // 未识别 USB 手柄检测：本次串流是否已弹过提示
+  private unhandledUsbHintShownThisSession: boolean = false;
+  // 已调度的检测定时器
+  private unhandledUsbDetectTimer: number | null = null;
+  // 重新检测周期（首次延迟，覆盖热插拔的简单场景）
+  private static readonly UNHANDLED_USB_DETECT_DELAY_MS: number = 5000;
+  private static readonly UNHANDLED_USB_DETECT_REPEAT_MS: number = 10000;
+
+  /**
+   * 串流就绪后异步探测 AI LLM 可用性。
+   * 推迟到此处而非 aboutToAppear，是为了避免与启动链路（serverinfo / launchApp / RTSP）
+   * 抢带宽和 TLS 资源；用户也已经看到画面，多 1-3 秒延迟感知不到。
+   */
+  private probeAiAvailableDeferred(): void {
+    const nvHttp = this.aiKeyNvHttp;
+    if (!nvHttp) return;
+    if (this.aiProbeTimer !== null) {
+      clearTimeout(this.aiProbeTimer);
+      this.aiProbeTimer = null;
+    }
+    this.aiProbeTimer = setTimeout(() => {
+      this.aiProbeTimer = null;
+      // 二次校验：页面已销毁则 aiKeyNvHttp 会被置空
+      if (!this.aiKeyNvHttp) return;
+      nvHttp.checkAiAvailable().then((available: boolean) => {
+        if (available && this.aiKeyNvHttp) {
+          ToastQueue.show({
+            message: '✨ AI LLM 已连接，可使用 AIV+ 功能',
+            duration: 2500
+          });
+        }
+      }).catch((err: Error) => {
+        Logger.warn('StreamPage', `[StreamPage] AI 可用性探测失败: ${err.message}`);
+      });
+    }, 2000);
+  }
+
+  /**
+   * 调度未识别 USB 手柄检测：
+   * - 串流连接成功后延时执行（让 GCK 充分扫描）
+   * - 周期性重新检测（捕捉热插拔事件，无需挂订阅）
+   * - 一旦弹过提示或用户选择不再提示，立即停止
+   */
+  private scheduleUnhandledUsbDetection(): void {
+    if (this.unhandledUsbDetectTimer !== null) {
+      return;
+    }
+    const tick = (): void => {
+      this.unhandledUsbDetectTimer = null;
+      // 串流已断开/页面销毁/已弹过 → 停止
+      if (!this.viewModel.isConnected || this.unhandledUsbHintShownThisSession) {
+        return;
+      }
+      this.runUnhandledUsbCheck().then(() => {
+        if (!this.viewModel.isConnected || this.unhandledUsbHintShownThisSession) {
+          return;
+        }
+        // 继续轮询（捕捉后续热插拔）
+        this.unhandledUsbDetectTimer = setTimeout(
+          tick,
+          StreamPage.UNHANDLED_USB_DETECT_REPEAT_MS
+        );
+      });
+    };
+    this.unhandledUsbDetectTimer = setTimeout(tick, StreamPage.UNHANDLED_USB_DETECT_DELAY_MS);
+  }
+
+  private cancelUnhandledUsbDetection(): void {
+    if (this.unhandledUsbDetectTimer !== null) {
+      clearTimeout(this.unhandledUsbDetectTimer);
+      this.unhandledUsbDetectTimer = null;
+    }
+  }
+
+  /**
+   * Network Boost 网络场景回调：弱信号预测/拥塞 提示用户
+   * 同一类提示 30s 内不重复弹，避免轰炸。
+   */
+  private handleNetworkScene(scene: SystemNetScene): void {
+    let key = '';
+    let message = '';
+    if (scene.weakSignalStartSec !== undefined && scene.weakSignalStartSec >= 0) {
+      // 弱信号预测优先级最高
+      key = 'weakSignal';
+      const eta = Math.max(1, Math.round(scene.weakSignalStartSec));
+      message = `📶 系统预测约 ${eta}s 后进入弱信号区，建议降低画质或保留信号良好位置`;
+    } else if (scene.scene === 'congestion' &&
+      (scene.recommendedAction === 'decreaseData' || scene.recommendedAction === 'suspendData')) {
+      key = 'congestion';
+      message = '📡 网络拥塞，可能出现卡顿，建议降低分辨率/码率';
+    } else if (scene.scene === 'frequentHandover') {
+      key = 'handover';
+      message = '🔄 网络频繁切换中，可能影响串流稳定性';
+    } else {
+      // normal/keepData/increaseData 不打扰用户
+      this.netSceneLastKey = '';
+      return;
+    }
+    const now = Date.now();
+    if (key === this.netSceneLastKey && now - this.netSceneToastedAt < 30_000) {
+      return;
+    }
+    this.netSceneLastKey = key;
+    this.netSceneToastedAt = now;
+    ToastQueue.show({ message, duration: 3000 });
+  }
+
+  private async runUnhandledUsbCheck(): Promise<void> {
+    try {
+      const list = this.gamepadManager.detectUnhandledUsbGamepadsThrottled();
+      if (list.length === 0) {
+        return;
+      }
+      const first = list[0];
+      const extra = list.length > 1 ? `（共 ${list.length} 个）` : '';
+      this.unhandledUsbHintShownThisSession = true;
+      promptAction.showDialog({
+        title: '检测到未识别的 USB 手柄',
+        message: `已识别为 ${first.name}${extra}，但系统未将其注册为手柄，可能导致按键无响应。\n\n是否切换到 USB 驱动模式？`,
+        buttons: [
+          { text: '本次跳过', color: '#888888' },
+          { text: '启用 USB 驱动', color: '#1F8AFF' }
+        ]
+      }).then((res: promptAction.ShowDialogSuccessResponse) => {
+        if (res.index === 1) {
+          this.forceUsbDriverMode();
+        }
+      }).catch((err: Error) => {
+        Logger.warn('StreamPage', '[StreamPage] 未识别 USB 手柄提示对话框关闭异常:', err);
+      });
+    } catch (err) {
+      Logger.warn('StreamPage', '[StreamPage] runUnhandledUsbCheck 异常:', err);
+    }
+  }
+  
+  /**
+   * 初始化体感助手
+   * 从设置加载配置，如果已启用则自动开始监听陀螺仪
+   */
+  private initializeGyroAssist(): void {
+    const settings = this.viewModel.inputSettings;
+    if (!settings) return;
+
+    const gyroAssist = GyroAssistService.getInstance();
+    gyroAssist.loadSettings({
+      sensitivity: settings.gyroSensitivity,
+      invertX: settings.gyroInvertX,
+      invertY: settings.gyroInvertY,
+      activationKey: settings.gyroActivationKey
+    });
+
+    // 设置即时发送回调（对齐 Android 的 updateContextWithGyroData → sendControllerInputPacket）
+    // 陀螺仪每次数据更新（120Hz）都会通过此回调立即发送融合后的手柄状态
+    gyroAssist.setSendCallback((
+      deviceId: number,
+      buttons: number,
+      leftStickX: number,
+      leftStickY: number,
+      rightStickX: number,
+      rightStickY: number,
+      leftTrigger: number,
+      rightTrigger: number,
+      controllerType: number
+    ) => {
+      if (this.viewModel.isConnected) {
+        this.viewModel.sendGamepadState(
+          deviceId, buttons, leftStickX, leftStickY,
+          rightStickX, rightStickY,
+          leftTrigger, rightTrigger, controllerType
+        );
+      }
+    });
+
+    if (settings.gyroAssistEnabled) {
+      gyroAssist.setEnabled(true);
+    }
+  }
+  
+  /**
+   * 处理手柄输入
+   */
+  private handleGamepadInput(deviceId: number, state: GamepadState): void {
+    if (!this.viewModel.isConnected) {
+      return;
+    }
+    
+    // 获取控制器类型（默认 Xbox）
+    const controllerType = this.controllerTypes.get(deviceId) ?? MoonlightControllerType.XBOX;
+    
+    // 体感助手：更新激活状态并融合右摇杆
+    const gyroAssist = GyroAssistService.getInstance();
+    let rsX = state.rightStickX;
+    let rsY = state.rightStickY;
+    if (gyroAssist.enabled) {
+      gyroAssist.updateActivation(state.leftTrigger, state.rightTrigger);
+      // 更新存储的手柄状态，供陀螺仪即时发送使用
+      gyroAssist.updateGamepadState(
+        deviceId,
+        state.buttons,
+        state.leftStickX,
+        state.leftStickY,
+        state.rightStickX,
+        state.rightStickY,
+        state.leftTrigger,
+        state.rightTrigger,
+        controllerType
+      );
+      const fused = gyroAssist.fuseRightStick(state.rightStickX, state.rightStickY);
+      rsX = fused.x;
+      rsY = fused.y;
+    }
+    
+    // 直接发送完整的手柄状态
+    this.viewModel.sendGamepadState(
+      deviceId,
+      state.buttons,
+      state.leftStickX,
+      state.leftStickY,
+      rsX,
+      rsY,
+      state.leftTrigger,
+      state.rightTrigger,
+      controllerType
+    );
+  }
+  
+  private async initializeDisplay(): Promise<void> {
+    try {
+      const displayInfo = display.getDefaultDisplaySync();
+      const screenWidth = displayInfo.width / displayInfo.densityPixels;
+      const screenHeight = displayInfo.height / displayInfo.densityPixels;
+      
+      // 更新 ViewModel 显示信息
+      this.viewModel.displayInfo.screenWidth = screenWidth;
+      this.viewModel.displayInfo.screenHeight = screenHeight;
+
+      // 更新缩放处理器容器尺寸
+      this.panZoomHandler.setParentSize(screenWidth, screenHeight);
+      
+      // 配置窗口
+      await this.windowManager?.configureWindow();
+    } catch (err) {
+      Logger.error('StreamPage', '初始化显示失败:', err);
+    }
+  }
+  
+  aboutToDisappear(): void {
+    Logger.info('StreamPage', 'StreamPage aboutToDisappear - cleaning up');
+
+    // 标记销毁：阻止异步启动链路在销毁后重新启用帧率保活
+    this.pageDisposed = true;
+    // 兜底复位帧率请求（含注销 XComponent 每帧回调），防高刷请求残留
+    this.resetStreamFrameHints();
+    this.stopUiHeartbeat();
+
+    // 取消 AI 可用性延时探测，避免页面销毁后回调触发 Toast / 网络请求
+    if (this.aiProbeTimer !== null) {
+      clearTimeout(this.aiProbeTimer);
+      this.aiProbeTimer = null;
+    }
+    this.threeFingerImeGestureHandler.dispose();
+    this.aiKeyNvHttp = null;
+    this.streamReportAiService = null;
+    this.streamReportAiRequestId++;
+
+    this.stopClipboardSync();
+
+    // 取消 Network Boost 场景监听
+    if (this.netSceneListener) {
+      NetworkBoostService.getInstance().removeSceneListener(this.netSceneListener);
+      this.netSceneListener = null;
+    }
+    
+    // 取消未识别 USB 手柄检测定时器
+    this.cancelUnhandledUsbDetection();
+    
+    // 取消生命周期监听
+    this.lifecycleManager.unregisterAppStateListener();
+    this.lifecycleManager.unregisterDisplayChangeListener();
+
+    // 停止后台保活（安全兜底）
+    this.lifecycleManager.stopBackgroundTask();
+    
+    // 清理 ViewModel
+    this.touchInputHandler.cancelActiveInput();
+    this.clearDs5TouchIndicators();
+    this.touchInputHandler.setDs5TouchpadSink(null);
+    this.touchInputHandler.setDs5TouchpadFeedbackCallback(null);
+    this.viewModel.dispose();
+    
+    // 清理触摸处理器
+    this.touchInputHandler.dispose();
+    
+    // 停止按键拦截器、鼠标 Monitor 和 DisplaySync
+    InputInterceptorService.getInstance().stop();
+    this.inputHandler.stopMouseInterceptor();
+    this.stopMouseKeepAlive();
+
+    // 停止体感助手
+    GyroAssistService.getInstance().dispose();
+    
+    // 清理手柄监听并重置会话状态（防止内存泄漏和重复绑定）
+    this.gamepadManager.setListener(null);
+    this.gamepadManager.resetSession();
+    
+    // 重置自定义按键状态（防止虚拟按键残留）
+    this.customKeyManager?.reset();
+    
+    // 恢复窗口设置
+    this.imeManager.hide();
+    this.imeManager.detachSilent();
+    this.windowManager?.restoreWindow();
+
+    // 恢复系统鼠标光标显示
+    try {
+      pointer.setPointerVisibleSync(true);
+    } catch (_) {}
+  }
+  
+  /**
+   * 处理返回按键 - 显示串流菜单而不是直接返回
+   * @returns true 表示已处理返回事件，阻止默认行为
+   */
+  onBackPress(): boolean {
+    // 释放所有通过 onKeyEvent 按下但未释放的物理键（防止 ESC 等键卡住）
+    this.inputHandler.releaseAllKeys();
+
+    if (this.showStreamReport) {
+      this.closeStreamReportAndReturn();
+      return true;
+    }
+
+    // 如果正在连接中，允许直接返回
+    if (this.viewModel.isConnecting) {
+      return false;
+    }
+
+    // 虚拟 PC 键盘正在显示时，优先收起
+    if (this.showVirtualKeyboard) {
+      this.showVirtualKeyboard = false;
+      return true;
+    }
+
+    // 自定义按键编辑模式时，优先退出编辑
+    if (this.customKeyEditMode) {
+      this.customKeyEditMode = false;
+      return true;
+    }
+
+    // IME 键盘正在显示时，优先收起键盘（排除弹出瞬间的误触发；锁定状态下不收起）
+    if (this.showKeyboardPanel && !this.imePanelLocked && Date.now() - this.imeManager.readyTime > 500) {
+      this.imeManager.hide();
+      return true;
+    }
+    
+    // 已连接时，显示串流菜单
+    if (this.viewModel.isConnected) {
+      this.showStreamMenu();
+      return true;  // 阻止默认返回行为
+    }
+    
+    // 其他情况允许返回
+    return false;
+  }
+  
+  /**
+   * 构建游戏菜单回调（从 showStreamMenu 提取，减少嵌套层级）
+   */
+  private buildGameMenuCallbacks(): GameMenuCallbacks {
+    return {
+      onDismiss: () => {
+        this.handleGameMenuDismissed();
+      },
+      onDisconnect: () => {
+        this.gameMenuDialogController?.close();
+        this.stopStreaming();
+      },
+      onQuitGame: () => {
+        this.gameMenuDialogController?.close();
+        this.quitGameAndReturn();
+      },
+      onTouchModeChanged: (mode: string) => {
+        this.setTouchMode(mode);
+      },
+      onOpenShortcutEditor: () => {
+        this.gameMenuDialogController?.close();
+        setTimeout(() => this.showShortcutEditor(), 300);
+      },
+      onEditShortcut: (shortcut) => {
+        this.gameMenuDialogController?.close();
+        setTimeout(() => this.showShortcutEditor(shortcut), 300);
+      },
+      onDeleteShortcut: (shortcut) => {
+        ToastQueue.show({ message: `快捷键 "${shortcut.name}" 已删除` });
+      },
+      onSendSuperCmd: (cmdId: string) => {
+        this.sendSuperCmd(cmdId);
+      },
+      onForceUsbDriver: () => {
+        this.forceUsbDriverMode();
+      },
+      onToggleKeyboard: () => {
+        if (this.useVirtualKeyboard) {
+          this.showVirtualKeyboard = !this.showVirtualKeyboard;
+        } else {
+          this.pendingShowIME = true;
+        }
+      },
+      onToggleCustomKeys: () => {
+        this.showCustomKeys = !this.showCustomKeys;
+        if (this.showCustomKeys) {
+          // 延迟刷新命中测试区域（参见 ARKUI_TOUCH_HANDLING_LESSONS.md）
+          setTimeout(() => { this.customKeyHitReady += 1; }, 100);
+        }
+      },
+      onEditCustomKeys: () => {
+        this.showCustomKeys = true;
+        this.customKeyEditMode = true;
+        // 延迟刷新命中测试区域
+        setTimeout(() => { this.customKeyHitReady += 1; }, 100);
+      },
+      onExportCustomKeys: () => {
+        this.customKeyManager?.exportProfile();
+      },
+      onImportCustomKeys: () => {
+        this.customKeyManager?.importProfile();
+      },
+      onToggleMouseEmulation: () => {
+        this.gamepadManager.toggleMouseEmulation();
+        const active = this.gamepadManager.isMouseEmulationActive();
+        ToastQueue.show({
+          message: active ? '手柄鼠标模拟已开启' : '手柄鼠标模拟已关闭',
+          duration: 2000
+        });
+      },
+      onControllerOpacityChange: (opacity: number) => {
+        this.controllerOpacityValue = opacity;
+        VirtualControllerOverlay.saveOpacity(opacity);
+      },
+      onControllerScaleChange: (scale: number) => {
+        this.controllerScaleValue = scale;
+        VirtualControllerOverlay.saveScale(scale);
+      },
+      onTouchPassthroughChange: (enabled: boolean) => {
+        this.touchPassthrough = enabled;
+      },
+      onClose: () => {
+        this.gameMenuDialogController?.close();
+        if (this.pendingShowIME) {
+          this.pendingShowIME = false;
+          setTimeout(() => this.imeManager.show(), 300);
+        }
+      },
+      onUnlockOverlay: () => {
+        this.viewModel.overlayState.config.isLocked = false;
+        this.viewModel.overlayState.configVersion++;
+        AppStorage.setOrCreate('perf_overlay_locked', false);
+        PreferencesUtil.put(SettingsKeys.PERF_OVERLAY_LOCKED, false);
+        ToastQueue.show({ message: '已解锁覆盖层', duration: 1500 });
+        this.gameMenuDialogController?.close();
+      },
+      onToggleWindowMode: async () => {
+        await this.windowManager?.toggleWindowMode();
+        await this.recalculateXComponentSize();
+      },
+      onTogglePanZoom: () => {
+        this.isTouchOverrideEnabled = !this.isTouchOverrideEnabled;
+        ToastQueue.show({
+          message: this.isTouchOverrideEnabled ? '画面缩放已开启，双指捏合缩放画面' : '画面缩放已关闭',
+          duration: 2000
+        });
+      },
+      onResetPanZoom: () => {
+        this.panZoomHandler.reset();
+        ToastQueue.show({ message: '缩放已重置', duration: 1500 });
+      },
+      onSwitchCustomKeyProfile: async (name: string) => {
+        this.customKeyManager?.reset();
+        const profile = await CustomKeyStore.switchProfile(name);
+        if (profile) {
+          this.customKeyProfileVersion++;
+          // 保存游戏→配置关联
+          if (this.appId > 0) {
+            CustomKeyStore.setGameProfile(this.appId, profile.name);
+          }
+        }
+      },
+      onTogglePrivacy: () => {
+        this.gameMenuDialogController?.close();
+        setTimeout(() => this.togglePrivacyFromMenu(), 300);
+      }
+    };
+  }
+
+  private handleGameMenuDismissed(): void {
+    this.gameMenuDialogController = null;
+    if (!this.mouseInputSuspended) return;
+    this.mouseInputSuspended = false;
+    // 菜单打开期间按键被强制释放过，恢复前对账仍按下的键
+    this.inputHandler.reconcileKeyState();
+    this.resumeMouseInterceptor();
+  }
+
+  /**
+   * 显示串流菜单
+   */
+  showStreamMenu(): void {
+    if (!this.menuManager) return;
+
+    // 暂停鼠标全速轮询（Monitor 暂停 + DisplaySync 停止）
+    this.mouseInputSuspended = true;
+    this.inputHandler.stopMouseInterceptor();
+    this.stopMouseKeepAlive();
+    
+    this.gameMenuDialogController = new CustomDialogController({
+      builder: GameMenuDialog({
+        viewModel: this.viewModel,
+        superCmds: this.cmdList,
+        isUsbDriverMode: !this.gamepadManager.isUsingGameControllerKit(),
+        hasUsbGamepad: this.gamepadManager.hasUsbGamepad(),
+        isMouseEmulationActive: this.gamepadManager.isMouseEmulationActive(),
+        hasConnectedGamepad: this.gamepadManager.getConnectedGamepads().length > 0,
+        isFullscreen: this.windowManager?.isFullscreen ?? true,
+        controllerOpacity: this.controllerOpacityValue,
+        controllerScale: this.controllerScaleValue,
+        touchPassthrough: this.touchPassthrough,
+        showCustomKeys: this.showCustomKeys,
+        isPanZoomActive: this.isTouchOverrideEnabled,
+        privacyScreenEnabled: this.privacyScreenEnabled,
+        callbacks: this.buildGameMenuCallbacks()
+      }),
+      alignment: DialogAlignment.CenterEnd,
+      customStyle: true,
+      backgroundColor: Color.Transparent,
+      onWillDismiss: (action: DismissDialogAction): void => {
+        action.dismiss();
+        this.handleGameMenuDismissed();
+      }
+    });
+    this.gameMenuDialogController.open();
+  }
+  
+  /**
+   * 获取 XComponent 实际渲染宽度（vp）
+   * 解析 Length 类型（'100%' 或数字）为实际 vp 值
+   */
+  private getXComponentWidthVp(): number {
+    if (typeof this.xComponentWidth === 'string') {
+      // '100%' 模式 — 优先使用 onAreaChange 缓存的实际尺寸
+      return this.xComponentActualWidthVp > 0
+        ? this.xComponentActualWidthVp
+        : this.viewModel.displayInfo.screenWidth;
+    }
+    return this.xComponentWidth as number;
+  }
+
+  /**
+   * 获取 XComponent 实际渲染高度（vp）
+   */
+  private getXComponentHeightVp(): number {
+    if (typeof this.xComponentHeight === 'string') {
+      return this.xComponentActualHeightVp > 0
+        ? this.xComponentActualHeightVp
+        : this.viewModel.displayInfo.screenHeight;
+    }
+    return this.xComponentHeight as number;
+  }
+
+  /**
+   * 根据位置名称获取 ArkUI Alignment 枚举
+   */
+  private getAlignmentFromPosition(position: string): Alignment {
+    switch (position) {
+      case '左上': return Alignment.TopStart;
+      case '上': return Alignment.Top;
+      case '右上': return Alignment.TopEnd;
+      case '左': return Alignment.Start;
+      case '居中': return Alignment.Center;
+      case '右': return Alignment.End;
+      case '左下': return Alignment.BottomStart;
+      case '下': return Alignment.Bottom;
+      case '右下': return Alignment.BottomEnd;
+      default: return Alignment.Center;
+    }
+  }
+
+  /**
+   * 更新画面位置和偏移（从 displayInfo 中读取设置）
+   */
+  private updateDisplayPosition(): void {
+    this.xComponentAlignment = this.getAlignmentFromPosition(
+      this.viewModel.displayInfo.screenPosition
+    );
+    // 将百分比偏移转换为 vp（基于 XComponent 实际尺寸）
+    const baseWidth = this.getXComponentWidthVp();
+    const baseHeight = this.getXComponentHeightVp();
+    this.xComponentOffsetX = baseWidth * this.viewModel.displayInfo.screenOffsetX / 100;
+    this.xComponentOffsetY = baseHeight * this.viewModel.displayInfo.screenOffsetY / 100;
+  }
+
+  /**
+   * 重新计算 XComponent 尺寸（窗口模式切换/窗口大小变化后调用）
+   */
+  private async recalculateXComponentSize(): Promise<void> {
+    if (!this.windowManager) return;
+
+    const measuredViewport = this.getMeasuredVideoViewportSize();
+    if (this.windowManager.isFullscreen && !measuredViewport) {
+      // 全屏：按屏幕尺寸精确计算 letterbox/pillarbox
+      const screenSize = await this.windowManager.updateScreenSize();
+      this.viewModel.displayInfo.screenWidth = screenSize.width;
+      this.viewModel.displayInfo.screenHeight = screenSize.height;
+      this.panZoomHandler.setParentSize(screenSize.width, screenSize.height);
+      const size = this.windowManager.calculateXComponentSize(
+        this.viewModel.displayInfo.stretchVideo
+      );
+      this.xComponentWidth = size.width;
+      this.xComponentHeight = size.height;
+    } else {
+      // 窗口/浮窗/画中画：按实际 ArkUI 内容区等比适配，避免 Surface 被父容器裁剪
+      const viewportSize = measuredViewport ? measuredViewport :
+        await this.windowManager.getCurrentWindowViewportSize();
+      const size = this.windowManager.calculateXComponentSizeForViewport(
+        viewportSize.width,
+        viewportSize.height,
+        this.viewModel.displayInfo.stretchVideo
+      );
+      this.viewModel.displayInfo.screenWidth = viewportSize.width;
+      this.viewModel.displayInfo.screenHeight = viewportSize.height;
+      this.panZoomHandler.setParentSize(viewportSize.width, viewportSize.height);
+      this.xComponentWidth = size.width;
+      this.xComponentHeight = size.height;
+    }
+    // 更新画面位置和偏移
+    this.updateDisplayPosition();
+  }
+
+  private async handleVideoViewportAreaChange(width: number, height: number): Promise<void> {
+    if (!this.windowManager) return;
+    if (width <= 0 || height <= 0) return;
+    if (Math.abs(this.videoViewportWidthVp - width) < 0.5 &&
+      Math.abs(this.videoViewportHeightVp - height) < 0.5) {
+      return;
+    }
+
+    this.videoViewportWidthVp = width;
+    this.videoViewportHeightVp = height;
+    await this.recalculateXComponentSize();
+  }
+
+  private getMeasuredVideoViewportSize(): DisplaySize | null {
+    if (this.videoViewportWidthVp <= 0 || this.videoViewportHeightVp <= 0) {
+      return null;
+    }
+    return {
+      width: this.videoViewportWidthVp,
+      height: this.videoViewportHeightVp
+    };
+  }
+
+  /**
+   * 恢复鼠标全速轮询（对话框关闭后调用）
+   */
+  private resumeMouseInterceptor(): void {
+    if (!this.viewModel.isConnected || this.mouseInputSuspended) return;
+    this.stopMouseKeepAlive();
+    const monitorOk = this.inputHandler.startMouseInterceptor(
+      this.getXComponentWidthVp(),
+      this.getXComponentHeightVp(),
+      this.windowManager?.windowId ?? -1,
+      this.windowManager?.isFullscreen ?? false
+    );
+    if (!monitorOk) {
+      this.startMouseKeepAlive();
+    }
+  }
+
+  /**
+   * 启动鼠标高帧率保持
+   *
+   * 使用 DisplaySync 直接向系统合成器请求高刷新率，
+   * 保持 ArkUI 渲染循环高帧率，使 .onMouse 以屏幕刷新率投递。
+   * 仅在 C++ Mouse Monitor 不可用时使用。
+   */
+  private startMouseKeepAlive(): void {
+    // The stream fallback already keeps this UI pipeline requesting frames.
+    if (this.pageDisposed || this.mouseDisplaySync || this.streamDisplaySync) return;
+    try {
+      const deviceRefreshRate = getDisplayRequestHz(Math.max(60, this.viewModel.streamConfig?.fps ?? 60));
+      this.mouseDisplaySync = displaySync.create();
+      this.mouseDisplaySync.setExpectedFrameRateRange({
+        min: 0,
+        max: deviceRefreshRate,
+        expected: deviceRefreshRate,
+      });
+      this.mouseDisplaySync.on('frame', () => {});
+      this.getUIContext().runScopedTask(() => { this.mouseDisplaySync?.start(); });
+      Logger.info('StreamPage', `StreamPage: DisplaySync 已启动（期望 ${deviceRefreshRate}Hz）`);
+    } catch (e) {
+      Logger.warn('StreamPage', 'StreamPage: DisplaySync 创建失败:', JSON.stringify(e));
+      if (this.mouseDisplaySync) {
+        try { this.mouseDisplaySync.stop(); } catch (_) {}
+        try { this.mouseDisplaySync.off('frame'); } catch (_) {}
+        this.mouseDisplaySync = null;
+      }
+    }
+  }
+
+  /**
+   * 停止鼠标高帧率保持
+   */
+  private stopMouseKeepAlive(): void {
+    if (this.mouseDisplaySync) {
+      try { this.mouseDisplaySync.stop(); } catch (_) {}
+      try { this.mouseDisplaySync.off('frame'); } catch (_) {}
+      this.mouseDisplaySync = null;
+      Logger.info('StreamPage', 'StreamPage: DisplaySync 已停止');
+    }
+  }
+
+  /**
+   * 显示快捷键编辑器
+   * @param editingShortcut 如果传入，则为编辑模式
+   */
+  showShortcutEditor(editingShortcut?: Shortcut): void {
+    this.shortcutEditorController = new CustomDialogController({
+      builder: ShortcutEditorDialog({
+        editingShortcut: editingShortcut,
+        callbacks: {
+          onSave: async (data: ShortcutEditData) => {
+            if (editingShortcut) {
+              await this.shortcutManager.updateShortcut(
+                editingShortcut.id,
+                data.name,
+                data.keys,
+                data.icon,
+                data.color,
+                data.keySequence
+              );
+              ToastQueue.show({ message: `快捷键 "${data.name}" 已更新` });
+            } else {
+              await this.shortcutManager.addShortcut(data.name, data.keys, data.icon, data.color, data.keySequence);
+              ToastQueue.show({ message: `快捷键 "${data.name}" 已添加` });
+            }
+            this.resumeMouseInterceptor();
+          },
+          onCancel: () => {
+            this.resumeMouseInterceptor();
+          }
+        }
+      }),
+      alignment: DialogAlignment.Center,
+      customStyle: true,
+      backgroundColor: Color.Transparent
+    });
+    this.shortcutEditorController.open();
+  }
+  
+  /**
+   * 循环切换自定义按键配置（SpecialAction 触发）
+   */
+  async cycleCustomKeyProfile(): Promise<void> {
+    this.customKeyManager?.reset();
+    const profile = await CustomKeyStore.cycleNextProfile();
+    if (profile) {
+      this.customKeyProfileVersion++;
+      // 保存游戏→配置关联
+      if (this.appId > 0) {
+        CustomKeyStore.setGameProfile(this.appId, profile.name);
+      }
+      ToastQueue.show({ message: `已切换到: ${profile.name}`, duration: 1500 });
+    } else {
+      ToastQueue.show({ message: '仅有一个配置', duration: 1500 });
+    }
+  }
+
+  /**
+   * 显示触摸模式菜单 (保留用于其他地方调用)
+   */
+  showTouchModeMenu(): void {
+    if (!this.menuManager) return;
+    
+    this.optionPickerDialogConfig = this.menuManager.getTouchModeMenuConfig();
+    this.optionPickerDialogController = new CustomDialogController({
+      builder: OptionPickerDialog({
+        config: this.optionPickerDialogConfig
+      }),
+      alignment: DialogAlignment.Bottom,
+      customStyle: true,
+      backgroundColor: Color.Transparent
+    });
+    this.optionPickerDialogController.open();
+  }
+  
+  /**
+   * 配置串流窗口（分辨率 → 窗口全屏 → 方向 → 屏幕尺寸 → XComponent 尺寸）
+   * 初次连接和重连均需调用，避免遗漏步骤导致画面缩小/黑边
+   */
+  private async configureStreamWindow(): Promise<void> {
+    // 设置串流分辨率
+    this.windowManager?.setStreamResolution(
+      this.viewModel.displayInfo.streamWidth,
+      this.viewModel.displayInfo.streamHeight
+    );
+
+    // 确保窗口处于全屏沉浸模式
+    await this.windowManager?.configureWindow();
+
+    // 配置屏幕方向
+    await this.windowManager?.configureOrientation();
+
+    // 更新屏幕尺寸
+    const screenSize = await this.windowManager?.updateScreenSize();
+    const measuredViewport = this.getMeasuredVideoViewportSize();
+    const viewportSize = measuredViewport ? measuredViewport : screenSize;
+    if (viewportSize) {
+      this.viewModel.displayInfo.screenWidth = viewportSize.width;
+      this.viewModel.displayInfo.screenHeight = viewportSize.height;
+      this.panZoomHandler.setParentSize(viewportSize.width, viewportSize.height);
+    }
+
+    // 计算 XComponent 尺寸（letterbox/pillarbox）
+    const xComponentSize = measuredViewport
+      ? this.windowManager?.calculateXComponentSizeForViewport(
+        measuredViewport.width,
+        measuredViewport.height,
+        this.viewModel.displayInfo.stretchVideo
+      )
+      : this.windowManager?.calculateXComponentSize(this.viewModel.displayInfo.stretchVideo);
+    if (xComponentSize) {
+      this.xComponentWidth = xComponentSize.width;
+      this.xComponentHeight = xComponentSize.height;
+      Logger.info('StreamPage', `StreamPage: XComponent 尺寸 = ${JSON.stringify(xComponentSize)}`);
+    }
+
+    // 应用画面位置和偏移
+    this.updateDisplayPosition();
+  }
+
+  /**
+   * 超分辨率状态 Toast：启动后提示用户超分是否生效
+   */
+  private showUpscaleToast(): void {
+    const config = this.viewModel.streamConfig;
+    if (!config || config.upscaleMode === 0) return;
+
+    try {
+      const d = display.getDefaultDisplaySync();
+      const screenW = d.width;
+      const screenH = d.height;
+      const streamW = config.width;
+      const streamH = config.height;
+
+      // 计算 XComponent 实际像素尺寸（保持视频宽高比的 letterbox 区域）
+      const videoAspectRatio = streamW / streamH;
+      const screenAspectRatio = screenW / screenH;
+      let outW: number, outH: number;
+      if (screenAspectRatio > videoAspectRatio) {
+        outH = screenH;
+        outW = Math.floor(outH * videoAspectRatio);
+      } else {
+        outW = screenW;
+        outH = Math.floor(outW / videoAspectRatio);
+      }
+
+      const activeNames: Record<number, string> = { 1: 'XEngine', 2: 'FSR 1' };
+      const activeMode = this.viewModel.activeUpscaleMode;
+      const needsUpscale = (streamW < outW || streamH < outH);
+
+      if (activeMode > 0 && needsUpscale) {
+        // native 真正启用了超分引擎
+        ToastQueue.show({
+          message: `${activeNames[activeMode]} 超分已启用: ${streamW}×${streamH} → ${outW}×${outH}`,
+          duration: 2500
+        });
+      } else if (!needsUpscale) {
+        // 串流分辨率 >= 屏幕，无需超分
+        ToastQueue.show({
+          message: `超分辨率未生效: 串流 ${streamW}×${streamH} ≥ 屏幕 ${outW}×${outH}`,
+          duration: 2500
+        });
+      } else {
+        // 用户开启了超分但 native 未激活（扩展不可用 / 初始化失败 / 运行时熔断）
+        ToastQueue.show({
+          message: `超分辨率初始化失败，已自动关闭 (${streamW}×${streamH} → ${outW}×${outH})`,
+          duration: 2500
+        });
+      }
+    } catch (_) {}
+  }
+
+  /**
+   * 设置 XComponent 帧率 + 获取 surfaceId + 启动串流
+   */
+  private async launchStream(): Promise<void> {
+    // 页面已销毁时（异步启动链路在 aboutToDisappear 后恢复）放弃启动，
+    // 避免对已销毁页面重新产生高刷请求
+    if (this.pageDisposed) {
+      Logger.warn('StreamPage', 'launchStream: 页面已销毁，跳过串流启动');
+      return;
+    }
+
+    // Reconnects reuse this page; release the previous request before any new attempt.
+    this.resetStreamFrameHints();
+    const surfaceId = this.xComponentController.getXComponentSurfaceId();
+
+    const streamConfig = this.viewModel.streamConfig;
+    if (streamConfig && streamConfig.fps > 60) {
+      const displayHz = getDisplayRequestHz(streamConfig.fps);
+      try {
+        const frameNode = this.getUIContext().getFrameNodeById('streamSurface');
+        this.xComponentFrameRequestActive = frameNode !== null && frameNode !== undefined &&
+          MoonBridge.setXComponentFrameRate(frameNode, displayHz);
+      } catch (e) {
+        Logger.warn('StreamPage', `XComponent 帧率请求不可用: ${e}`);
+      }
+      if (!this.xComponentFrameRequestActive && displayHz > 60) {
+        this.startStreamDisplaySync(displayHz);
+      }
+      try {
+        MoonBridge.setFrameRateKeepAlive(true, displayHz);
+      } catch (e) {
+        Logger.warn('StreamPage', `启用帧率请求失败: ${e}`);
+      }
+      this.startStreamFrameDiagnostics(displayHz);
+    }
+
+    await this.viewModel.startStreaming(this.computerId, this.appId, surfaceId, this.context, this.displayGuid, this.useVdd);
+
+    // 将屏幕 DS5 触控板绑定到本次会话的 controller slot 0。
+    this.touchInputHandler.setDs5TouchpadSink(this.viewModel.getSession());
+    this.touchInputHandler.setDs5TouchpadFeedbackCallback((feedback: Ds5TouchpadFeedback): void => {
+      this.handleDs5TouchpadFeedback(feedback);
+    });
+    this.touchInputHandler.setDs5TouchpadUnsupportedCallback(() => {
+      if (this.viewModel.touchMode !== TouchMode.DS5_TOUCHPAD) return;
+      setTimeout(() => {
+        if (this.viewModel.touchMode !== TouchMode.DS5_TOUCHPAD) return;
+        this.setTouchMode(TouchMode.TRACKPAD);
+        ToastQueue.show({ message: '主机未启用 DS5 触控板协议，已回退为普通触控板', duration: 2500 });
+      }, 0);
+    });
+
+    if (this.viewModel.touchMode === TouchMode.DS5_TOUCHPAD &&
+      !this.viewModel.isDs5TouchpadSupported()) {
+      this.setTouchMode(TouchMode.TRACKPAD);
+      ToastQueue.show({ message: '主机未启用 DS5 触控板协议，已回退为普通触控板', duration: 2500 });
+    }
+
+    // 串流启动后调度未识别 USB 手柄检测（延迟内 GCK 完成扫描）
+    this.scheduleUnhandledUsbDetection();
+  }
+
+  async startStreaming(): Promise<void> {
+    try {
+      // 启动虚拟组网（VPN + EasyTier）
+      // 仅在用户点击"连接"走到这里时才拉起；首次会弹系统授权框
+      // 每台电脑的虚拟地址不同，按这台电脑登记的地址探测是否已打通
+      const info = ComputerManager.getInstance().getComputer(this.computerId);
+      const target: string = info !== undefined
+        ? (info.manualAddress !== undefined && info.manualAddress.length > 0
+          ? info.manualAddress
+          : (info.address.length > 0 ? info.address : HOST_VIRTUAL_IP))
+        : HOST_VIRTUAL_IP;
+      const vpnOk = await VpnController.getInstance().start(target);
+      Logger.info('StreamPage', `VPN start result: ${vpnOk}`);
+      if (!vpnOk) {
+        // 组网失败必须明确告知并中止，继续往下走只会无声卡死
+        Logger.warn('StreamPage', 'VPN/组网启动失败，中止串流并返回主页');
+        promptAction.showDialog({
+          title: '无法连接到电脑',
+          message: '虚拟组网没有建立成功（可能未允许 VPN 权限，或网络不可达）。\n\n你可以：\n1. 重新点连接，并在弹窗中允许 VPN；\n2. 或打开外部 EasyTier 连接后重试。',
+          buttons: [{ text: '返回', color: '#007DFF' }]
+        }).then(() => {
+          AppNav.pop();
+        });
+        return;
+      }
+
+      // 加载设置
+      await this.viewModel.loadSettings();
+      this.endStreamReportEnabled = await PreferencesUtil.get<boolean>(SettingsKeys.LATENCY_TOAST, false);
+      this.lifecycleManager.setLatencyToastEnabled(this.endStreamReportEnabled);
+      this.lifecycleManager.setDisableWarnings(
+        await PreferencesUtil.get<boolean>(SettingsKeys.DISABLE_WARNINGS, false)
+      );
+      this.enableBackgroundTask = await PreferencesUtil.get<boolean>(SettingsKeys.ENABLE_BACKGROUND_TASK, true);
+      this.lifecycleManager.setEnableBackgroundTask(this.enableBackgroundTask);
+      this.useVirtualKeyboard = await PreferencesUtil.get<boolean>(SettingsKeys.ENABLE_ONSCREEN_KEYBOARD, false);
+      this.controllerScaleValue = await VirtualControllerOverlay.loadScale();
+      this.controllerOpacityValue = await VirtualControllerOverlay.loadOpacity();
+      await this.gamepadManager.reloadSettings();
+
+      // 配置 ESC 菜单按键（可替换为 F1/F12/~ 等）
+      const escMenuKey = await PreferencesUtil.get<string>(SettingsKeys.ESC_MENU_KEY, 'ESC');
+      this.inputHandler.setMenuKey(escMenuKey);
+      const enableEscMenu = await PreferencesUtil.get<boolean>(SettingsKeys.ENABLE_ESC_MENU, true);
+      this.inputHandler.setEscMenuEnabled(enableEscMenu);
+
+      // 初始化自定义按键存储
+      await this.customKeyManager?.init();
+
+      // 配置窗口（分辨率→全屏→方向→屏幕尺寸→XComponent 尺寸）
+      await this.configureStreamWindow();
+
+      // 设置 HDR 高亮度（如果启用）
+      const streamConfig = this.viewModel.streamConfig;
+      if (streamConfig) {
+        await this.windowManager?.setHdrBrightness(streamConfig.hdr, streamConfig.hdrHighBrightness);
+        // AIHDR 模式 (sdrToHdrMode===2)：启用系统 AI HDR 修饰器
+        if (streamConfig.sdrToHdrMode === 2 && isAihdrSupported()) {
+          const m = new AihdrModifier();
+          m.enabled = true;
+          m.brightness = this.aihdrModifier.brightness;
+          this.aihdrModifier = m;
+        }
+      }
+      
+      // 设置触摸输入模式
+      this.touchInputHandler.setMode(this.toTouchInputMode(this.viewModel.touchMode));
+      // 配置双击时间阈值和双击拖动
+      if (streamConfig) {
+        this.touchInputHandler.setDoubleTapTimeThreshold(streamConfig.doubleTapTimeThreshold);
+        this.touchInputHandler.setEnableDoubleClickDrag(streamConfig.enableDoubleClickDrag);
+        this.touchInputHandler.setLowLatencyTouch(streamConfig.lowLatencyTouch);
+      }
+      
+      // 设置连接终止回调
+      this.viewModel.setConnectionTerminatedCallback((errorCode: number) => {
+        this.stopClipboardSync();
+        this.lifecycleManager.handleConnectionTerminated(errorCode);
+      });
+
+      // 设置分辨率变化回调（服务端屏幕旋转/分辨率变化时同步客户端布局）
+      this.viewModel.setResolutionChangedCallback((width: number, height: number) => {
+        this.lifecycleManager.handleServerResolutionChanged(width, height);
+      });
+
+      // 获取 surfaceId → 设置帧率 → 启动串流
+      await this.launchStream();
+      this.streamStartedAtMs = Date.now();
+
+      // 串流就绪后再做 AI 服务可用性探测，避免与启动链路抢带宽
+      this.probeAiAvailableDeferred();
+
+      await this.startClipboardSync();
+
+      // 超分辨率状态 Toast
+      this.showUpscaleToast();
+
+      // 启动后台保活（AVSession + 长时任务），防止退到后台时进程被冻结
+      if (this.enableBackgroundTask) {
+        await this.lifecycleManager.startBackgroundTask(this.context, this.appName || undefined);
+      }
+
+      // 启动按键拦截器（拦截被系统劫持的手柄按键 + 全量键盘按键转发主机）
+      let keyInterceptorStarted = false;
+      if (this.viewModel.inputSettings?.enableKeyInterceptor) {
+        keyInterceptorStarted = this.inputHandler.startKeyInterceptor();
+      }
+
+      // 静默 attach IME 仅作兜底：拦截器未启动时通过输入法回调接收文字输入。
+      // 两者不能同时开启，否则字母会重复发送（拦截器按键事件 + 输入法文本各一次）
+      if (!keyInterceptorStarted) {
+        this.imeManager.attachSilent();
+      }
+
+      // 诊断：本次串流键盘走哪条路。主路(按键直通)负责全部按键；
+      // 兜底路(输入法)只能送文字，方向键/Win/功能键进不来。
+      // 用户报"只有打字能输入"时，看这行就知道当时是哪条路在干活。
+      FileLog.d('KB-DIAG',
+        `keyboard path: 反劫持开关=${this.viewModel.inputSettings?.enableKeyInterceptor ?? false} 主路启动=${keyInterceptorStarted} 兜底=${keyInterceptorStarted ? '未启用' : '已启用'}`);
+
+      // 启动鼠标全速轮询：优先 C++ Monitor，不可用时 DisplaySync 兜底
+      const monitorOk = this.inputHandler.startMouseInterceptor(
+        this.getXComponentWidthVp(),
+        this.getXComponentHeightVp(),
+        this.windowManager?.windowId ?? -1,
+        this.windowManager?.isFullscreen ?? false
+      );
+      if (!monitorOk) {
+        this.startMouseKeepAlive();
+      }
+
+      // 初始化体感助手
+      this.initializeGyroAssist();
+
+      // 本地光标显示控制
+      // showLocalCursor=true 时保持本地系统光标可见（双光标模式，需配合绝对鼠标模式使用）
+      // showLocalCursor=false 时隐藏本地系统光标，仅显示远端视频流中的光标
+      if (!this.viewModel.showLocalCursor) {
+        try {
+          pointer.setPointerVisibleSync(false);
+          Logger.info('StreamPage', 'StreamPage: 已隐藏本地系统鼠标光标');
+        } catch (e) {
+          Logger.warn('StreamPage', 'StreamPage: 隐藏鼠标光标失败:', JSON.stringify(e));
+        }
+      } else {
+        Logger.info('StreamPage', 'StreamPage: 本地光标模式已启用，保持系统光标可见');
+      }
+      
+    } catch (err) {
+      Logger.error('StreamPage', '开始串流失败:', err);
+      // 启动失败时 launchStream 可能已启用帧率保活，这里幂等复位
+      this.resetStreamFrameHints();
+    }
+  }
+  
+  /**
+   * 收归的退出串流并返回：恢复窗口、延迟、AppNav.pop()。
+   * 供 stopStreaming / quitGameAndReturn 复用，避免重复逻辑。
+   */
+  private async exitStreamAndReturn(): Promise<void> {
+    // 隐私屏会话断开时，提示物理屏恢复中（值班员有15秒确认窗口）
+    try {
+      const privacyEnabled = await PreferencesUtil.get<string | boolean>(SettingsKeys.PRIVACY_SCREEN_ENABLED, false);
+      if (privacyEnabled === true || privacyEnabled === 'true') {
+        ToastQueue.show({
+          message: '物理屏恢复中，约需15秒…',
+          duration: 3000
+        });
+      }
+    } catch (err) {
+      Logger.warn('StreamPage', `读取隐私屏设置失败: ${(err as Error).message}`);
+    }
+    await this.windowManager?.restoreWindow();
+    await new Promise<void>((resolve) => setTimeout(resolve, 150));
+    // 断开后延迟关闭 VPN（5 分钟内重连无需重新组网）
+    VpnController.getInstance().scheduleStop();
+    AppNav.pop();
+  }
+
+  /**
+   * 生成当前串流战报（必须在 viewModel.stopStreaming/quitGame 清空 session 前调用）
+   */
+  private buildCurrentStreamReport(): BuiltStreamReport {
+    const session = this.viewModel.getSession();
+    const sessionStats = session ? session.getSummaryStats() : null;
+    const stats = sessionStats || this.viewModel.performanceStats;
+    const durationMs = this.streamStartedAtMs > 0 ? Date.now() - this.streamStartedAtMs : 0;
+    const snapshot = new StreamReportStats();
+    snapshot.fps = stats.fps;
+    snapshot.renderedFps = stats.renderedFps;
+    snapshot.bitrate = stats.bitrate;
+    snapshot.latency = stats.latency;
+    snapshot.hostLatency = stats.hostLatency;
+    snapshot.networkLatency = stats.networkLatency;
+    snapshot.packetLoss = stats.packetLoss;
+    snapshot.decodedFrames = stats.decodedFrames;
+    snapshot.droppedFrames = stats.droppedFrames;
+    snapshot.globalAvgDecodeLatency = stats.globalAvgDecodeLatency;
+    snapshot.globalAvgHostLatency = stats.globalAvgHostLatency;
+    snapshot.globalAvgFps = stats.globalAvgFps;
+    snapshot.droppedByL1 = stats.droppedByL1;
+    snapshot.droppedByL2 = stats.droppedByL2;
+    snapshot.droppedByL3 = stats.droppedByL3;
+    snapshot.droppedByL4 = stats.droppedByL4;
+    snapshot.droppedByL5 = stats.droppedByL5;
+    if (sessionStats) {
+      snapshot.hostMaxLuminance = sessionStats.hostMaxLuminance;
+      snapshot.hostMaxFullFrame = sessionStats.hostMaxFullFrame;
+      snapshot.hdrMode = sessionStats.hdrMode;
+      snapshot.hdrBrightnessSource = sessionStats.hdrBrightnessSource;
+      snapshot.hdrBrightnessOverride = sessionStats.hdrBrightnessOverride;
+      snapshot.measuredSdrNits = sessionStats.measuredSdrNits;
+      snapshot.measuredPeakNits = sessionStats.measuredPeakNits;
+      snapshot.measuredFullFrameNits = sessionStats.measuredFullFrameNits;
+      snapshot.sentSdrWhiteNits = sessionStats.sentSdrWhiteNits;
+      snapshot.sentPeakNits = sessionStats.sentPeakNits;
+      snapshot.sentFullFrameNits = sessionStats.sentFullFrameNits;
+    }
+    if (this.viewModel.streamConfig?.hdr) {
+      try {
+        const brightnessInfo = display.getBrightnessInfo(0);
+        snapshot.phoneSdrNits = Math.round(brightnessInfo.sdrNits);
+        snapshot.phonePeakNits = Math.round(brightnessInfo.sdrNits * brightnessInfo.maxHeadroom);
+      } catch (_) {
+        // 低版本系统无亮度诊断 API 时保持 0，不显示诊断卡片
+      }
+    }
+    if (sessionStats) {
+      snapshot.codecOutputFps = sessionStats.codecOutputFps;
+      snapshot.codecOutputFrames = sessionStats.codecOutputFrames;
+      snapshot.framesLost = sessionStats.framesLost;
+      snapshot.totalFrames = sessionStats.totalFrames;
+      snapshot.droppedByQueueOverflow = sessionStats.droppedByQueueOverflow;
+      snapshot.droppedByTimeout = sessionStats.droppedByTimeout;
+      snapshot.syncDrainEvents = sessionStats.syncDrainEvents;
+      snapshot.syncDrainFrames = sessionStats.syncDrainFrames;
+      snapshot.syncDecode = sessionStats.syncDecode;
+      snapshot.hostPacedPresentationActive = sessionStats.hostPacedPresentationActive;
+      snapshot.presentationPrepared = sessionStats.presentationPrepared;
+      snapshot.presentationScheduled = sessionStats.presentationScheduled;
+      snapshot.presentationExpired = sessionStats.presentationExpired;
+      snapshot.presentationMissing = sessionStats.presentationMissing;
+      snapshot.presentationFuture = sessionStats.presentationFuture;
+      snapshot.presentationNonMonotonicDrops = sessionStats.presentationNonMonotonicDrops;
+      snapshot.presentationRenderFallbacks = sessionStats.presentationRenderFallbacks;
+      snapshot.presentationLeadUnder1Ms = sessionStats.presentationLeadUnder1Ms;
+      snapshot.presentationLead1To2Ms = sessionStats.presentationLead1To2Ms;
+      snapshot.presentationLead2To4Ms = sessionStats.presentationLead2To4Ms;
+      snapshot.presentationLead4To8Ms = sessionStats.presentationLead4To8Ms;
+      snapshot.presentationLeadAtLeast8Ms = sessionStats.presentationLeadAtLeast8Ms;
+      snapshot.presentationPendingHighWater = sessionStats.presentationPendingHighWater;
+    }
+    const result = new BuiltStreamReport();
+    result.stats = snapshot;
+    result.config = createStreamReportConfigSnapshot(this.viewModel.streamConfig);
+    result.durationMs = durationMs;
+    result.data = buildStreamReportDataFromSnapshot(snapshot, result.config, this.appName || '远程游戏', durationMs);
+    result.diagnosticsText = buildStreamDiagnosticsText(
+      snapshot, result.config, this.appName || '远程游戏', durationMs);
+    return result;
+  }
+
+  private async saveStreamDiagnostics(text: string): Promise<void> {
+    if (text.length === 0) {
+      return;
+    }
+    try {
+      await PreferencesUtil.put(SettingsKeys.LAST_STREAM_DIAGNOSTICS, text);
+    } catch (err) {
+      Logger.warn('StreamPage', '[StreamPage] 保存串流诊断失败:', JSON.stringify(err));
+    }
+  }
+
+  private enrichStreamReportWithAi(report: BuiltStreamReport): void {
+    const aiService = this.streamReportAiService;
+    const nvHttp = this.aiKeyNvHttp;
+    if (!aiService || !nvHttp) {
+      return;
+    }
+
+    const requestId = ++this.streamReportAiRequestId;
+    nvHttp.checkAiAvailable().then((available: boolean) => {
+      if (requestId !== this.streamReportAiRequestId || !this.showStreamReport || !this.streamReportAiService) {
+        return;
+      }
+      if (!available) {
+        return;
+      }
+      this.streamReportData = markStreamReportAiLoading(report.data);
+      aiService.summarize(report.data, report.stats, report.config, report.durationMs).then((aiReport: StreamReportData) => {
+        if (requestId !== this.streamReportAiRequestId || !this.showStreamReport || !this.streamReportAiService) {
+          return;
+        }
+        this.streamReportData = aiReport;
+      }).catch((err: Error) => {
+        Logger.warn('StreamPage', `[StreamPage] AI 串流战报总结失败: ${err.message}`);
+        if (requestId === this.streamReportAiRequestId && this.showStreamReport) {
+          this.streamReportData = report.data;
+        }
+      });
+    }).catch((err: Error) => {
+      Logger.warn('StreamPage', `[StreamPage] AI 串流战报可用性检查失败: ${err.message}`);
+    });
+  }
+
+  // Public ArkUI fallback for legacy XComponent construction and older APIs.
+  private startStreamDisplaySync(displayHz: number): void {
+    if (this.pageDisposed || this.streamDisplaySync) return;
+    try {
+      this.streamDisplaySync = displaySync.create();
+      this.streamDisplaySync.setExpectedFrameRateRange({ min: 0, max: displayHz, expected: displayHz });
+      this.streamDisplaySync.on('frame', () => { this.streamDisplayCallbacks++; });
+      // launchStream resumes after awaits: explicitly bind start to this window.
+      this.getUIContext().runScopedTask(() => { this.streamDisplaySync?.start(); });
+      this.stopMouseKeepAlive();
+      Logger.info('StreamPage', `FrameRateRequest: path=DisplaySync expected=${displayHz}`);
+    } catch (e) {
+      if (this.streamDisplaySync) {
+        try { this.streamDisplaySync.stop(); } catch (_) {}
+        try { this.streamDisplaySync.off('frame'); } catch (_) {}
+        this.streamDisplaySync = null;
+      }
+      Logger.warn('StreamPage', `DisplaySync 帧率请求失败: ${e}`);
+    }
+  }
+
+  /** 黑匣子：主界面心跳。每 2 秒覆盖写一次时间戳，卡死后最后一条即冻结时刻 */
+  private startUiHeartbeat(): void {
+    this.stopUiHeartbeat();
+    FileLog.writeHeartbeat();
+    let tick = 0;
+    this.uiHeartbeatTimer = setInterval(() => {
+      FileLog.writeHeartbeat();
+      // 诊断：每 20 秒记一次键盘三条道的存活与收键情况。
+      // 出现"打字能进、其他键哑"时，能从这条时间线看出是哪条道停了
+      if (++tick % 10 === 0) {
+        FileLog.d('KB-DIAG',
+          `key alive: 主路=${this.inputHandler.isKeyInterceptorAlive() ? '在' : '掉'} 主路收键=${this.inputHandler.getInterceptedKeyCount()} 窗口收键=${this.inputHandler.getArkUiKeyCount()} 兜底收字=${this.imeManager.getSilentTextCount()}`);
+      }
+    }, 2000);
+  }
+
+  private stopUiHeartbeat(): void {
+    if (this.uiHeartbeatTimer !== null) {
+      clearInterval(this.uiHeartbeatTimer);
+      this.uiHeartbeatTimer = null;
+    }
+  }
+
+  private startStreamFrameDiagnostics(displayHz: number): void {
+    if (this.streamFrameDiagnosticTimer !== null) clearInterval(this.streamFrameDiagnosticTimer);
+    this.streamDisplayCallbacks = 0;
+    let lastTime = Date.now();
+    this.streamFrameDiagnosticTimer = setInterval(() => {
+      const now = Date.now();
+      const seconds = Math.max(0.001, (now - lastTime) / 1000);
+      let screenHz = 0;
+      try { screenHz = display.getDefaultDisplaySync().refreshRate; } catch (_) {}
+      const stats = this.viewModel.performanceStats;
+      const path = this.xComponentFrameRequestActive
+        ? 'XComponent'
+        : this.streamDisplaySync !== null ? 'DisplaySync' : 'none';
+      Logger.info('StreamPage', `FrameRateDiagnostics: rxFps=${stats.fps.toFixed(1)} submittedFps=${stats.renderedFps.toFixed(1)} decodeMs=${stats.globalAvgDecodeLatency.toFixed(1)} drops=${stats.droppedFrames} requestedHz=${displayHz} screenHz=${screenHz} path=${path} displaySyncActive=${this.streamDisplaySync !== null} displaySyncCallbackHz=${(this.streamDisplayCallbacks / seconds).toFixed(1)}`);
+      this.streamDisplayCallbacks = 0;
+      lastTime = now;
+    }, 5000);
+  }
+
+  // Idempotent cleanup for stream end, startup failure and page destruction.
+  private resetStreamFrameHints(): void {
+    if (this.streamFrameDiagnosticTimer !== null) {
+      clearInterval(this.streamFrameDiagnosticTimer);
+      this.streamFrameDiagnosticTimer = null;
+    }
+    if (this.streamDisplaySync) {
+      try { this.streamDisplaySync.stop(); } catch (_) {}
+      try { this.streamDisplaySync.off('frame'); } catch (_) {}
+      this.streamDisplaySync = null;
+    }
+    try {
+      MoonBridge.setFrameRateKeepAlive(false);
+    } catch (_) {}
+    try {
+      const frameNode = this.xComponentFrameRequestActive ? this.getUIContext().getFrameNodeById('streamSurface') : null;
+      if (frameNode) {
+        MoonBridge.setXComponentFrameRate(frameNode, 60);
+      }
+    } catch (_) {}
+    this.xComponentFrameRequestActive = false;
+  }
+
+  private prepareStreamEndUiImmediate(): void {
+    this.cancelUnhandledUsbDetection();
+    this.inputHandler.resetState();
+    this.inputHandler.stopMouseInterceptor();
+    this.stopMouseKeepAlive();
+    this.resetStreamFrameHints();
+    try {
+      pointer.setPointerVisibleSync(true);
+    } catch (_) {}
+  }
+
+  /**
+   * 无战报模式下，仍沿用原来的前台清理流程：停止后台保活并恢复窗口。
+   */
+  private async prepareStreamEndUi(): Promise<void> {
+    this.prepareStreamEndUiImmediate();
+    await this.lifecycleManager.stopBackgroundTask();
+    await this.windowManager?.restoreWindow();
+  }
+
+  private stopClipboardSync(): void {
+    if (!this.clipboardSyncService) {
+      return;
+    }
+
+    this.clipboardSyncService.stop();
+    this.clipboardSyncService = null;
+  }
+
+  private async ensureClipboardPermissionGranted(): Promise<boolean> {
+    try {
+      const atManager = abilityAccessCtrl.createAtManager();
+      const bundleInfo = await bundleManager.getBundleInfoForSelf(
+        bundleManager.BundleFlag.GET_BUNDLE_INFO_WITH_APPLICATION
+      );
+      const tokenId = bundleInfo.appInfo.accessTokenId;
+      const permission: Permissions = 'ohos.permission.READ_PASTEBOARD';
+
+      let granted = atManager.checkAccessTokenSync(tokenId, permission) ===
+        abilityAccessCtrl.GrantStatus.PERMISSION_GRANTED;
+
+      if (!granted) {
+        Logger.info('StreamPage', '[StreamPage] 请求剪贴板权限...');
+        const result = await atManager.requestPermissionsFromUser(this.context, [permission]);
+        granted = result.authResults.length > 0 &&
+          result.authResults[0] === abilityAccessCtrl.GrantStatus.PERMISSION_GRANTED;
+      }
+
+      return granted;
+    } catch (error) {
+      Logger.error('StreamPage', '[StreamPage] 检查剪贴板权限失败:', error);
+      return false;
+    }
+  }
+
+  private async startClipboardSync(): Promise<void> {
+    this.stopClipboardSync();
+
+    try {
+      const enableClipboardSyncText = await PreferencesUtil.get(SettingsKeys.ENABLE_CLIPBOARD_SYNC_TEXT, false);
+      const enableClipboardSyncImage = await PreferencesUtil.get(SettingsKeys.ENABLE_CLIPBOARD_SYNC_IMAGE, false);
+      if (!enableClipboardSyncText && !enableClipboardSyncImage) {
+        return;
+      }
+
+      const granted = await this.ensureClipboardPermissionGranted();
+      if (!granted) {
+        ToastQueue.show({ message: '未授予剪贴板权限，无法启用剪贴板同步', duration: 2000 });
+        return;
+      }
+
+      const clipboardConfig = new ClipboardSyncConfig();
+      clipboardConfig.enableSyncText = enableClipboardSyncText;
+      clipboardConfig.enableSyncImage = enableClipboardSyncImage;
+      const clipboardObserver: ClipboardSyncObserver = new StreamClipboardObserver();
+      let blobTransport: SunshineClipboardBlobTransport | null = null;
+      if (enableClipboardSyncImage) {
+        const computer = ComputerManager.getInstance().getComputer(this.computerId);
+        if (computer) {
+          blobTransport = new SunshineClipboardBlobTransport(NvHttp.fromComputer(computer, this.context));
+        } else {
+          Logger.warn('StreamPage', `[StreamPage] 图片剪贴板同步已开启但找不到 computer(id=${this.computerId})，blob 通道不可用`);
+        }
+      }
+      this.clipboardSyncService = new ClipboardSyncService(
+        clipboardConfig,
+        clipboardObserver,
+        blobTransport
+      );
+      this.clipboardSyncService.start();
+    } catch (error) {
+      Logger.error('StreamPage', 'Failed to initialize clipboard sync:', error);
+      this.stopClipboardSync();
+    }
+  }
+
+  /**
+   * 战报展示期间，真正的停流/退游戏在后台继续执行；关闭战报前再等待其收尾。
+   */
+  private runStreamShutdownInBackground(label: string, task: () => Promise<void>): void {
+    if (this.pendingStreamShutdown) {
+      Logger.info('StreamPage', `[StreamPage] ${label}流程已在进行中，忽略重复请求`);
+      return;
+    }
+
+    this.pendingStreamShutdownLabel = label;
+    this.pendingStreamShutdown = (async (): Promise<void> => {
+      try {
+        await task();
+      } catch (err) {
+        Logger.error('StreamPage', `[StreamPage] ${label}后台收尾失败:`, err);
+      } finally {
+        this.pendingStreamShutdown = null;
+        this.pendingStreamShutdownLabel = '';
+      }
+    })();
+  }
+
+  private runDetachedAsyncTask(label: string, task: () => Promise<void>): void {
+    task().catch((err: Error) => {
+      Logger.error('StreamPage', `[StreamPage] ${label}失败:`, err);
+    });
+  }
+
+  private async waitForPendingStreamShutdown(): Promise<void> {
+    const pending = this.pendingStreamShutdown;
+    if (!pending) {
+      return;
+    }
+
+    ToastQueue.show({
+      message: this.pendingStreamShutdownLabel
+        ? `${this.pendingStreamShutdownLabel}，请稍候…`
+        : '正在结束串流…',
+      duration: 1200
+    });
+    await pending;
+  }
+
+  private async sendLockScreenShortcutBeforeDisconnect(): Promise<void> {
+    if (!this.viewModel.streamConfig?.lockScreenAfterDisconnect) {
+      return;
+    }
+
+    this.viewModel.getSession()?.sendKeys([0x5B, 0x4C]); // VK_LWIN + VK_L
+    await new Promise<void>((resolve) => setTimeout(resolve, 500));
+  }
+
+  private async closeStreamReportAndReturn(): Promise<void> {
+    if (this.isClosingStreamReport) {
+      return;
+    }
+
+    this.isClosingStreamReport = true;
+    try {
+      await this.waitForPendingStreamShutdown();
+      this.streamReportAiRequestId++;
+      this.showStreamReport = false;
+      await this.exitStreamAndReturn();
+    } catch (err) {
+      this.isClosingStreamReport = false;
+      Logger.error('StreamPage', '[StreamPage] 关闭串流战报失败:', err);
+    }
+  }
+
+  async stopStreaming(): Promise<void> {
+    if (this.pendingStreamShutdown) {
+      Logger.info('StreamPage', '[StreamPage] stopStreaming 已在执行，忽略重复调用');
+      return;
+    }
+
+    this.stopClipboardSync();
+    this.touchInputHandler.cancelActiveInput();
+    this.clearDs5TouchIndicators();
+
+    const report = this.buildCurrentStreamReport();
+    // 诊断：串流结束时的真实链路指标落盘。丢包/码率是判断"是不是隧道扛不住"的关键，
+    // 且这行紧挨着后面的 scheduleStop，能把"画面冻住 → 收摊"的先后顺序钉死在时间线上
+    FileLog.d('StreamPage',
+      `stream end: durationMs=${Date.now() - this.streamStartedAtMs} | ${report.diagnosticsText.split('\n').join(' | ').substring(0, 400)}`);
+    await this.saveStreamDiagnostics(report.diagnosticsText);
+
+    if (!this.endStreamReportEnabled) {
+      await this.prepareStreamEndUi();
+      await this.exitStreamAndReturn();
+      this.runDetachedAsyncTask('后台停止串流', (): Promise<void> => this.viewModel.stopStreaming());
+      return;
+    }
+
+    this.prepareStreamEndUiImmediate();
+    this.streamReportData = report.data;
+    this.streamDiagnosticsText = report.diagnosticsText;
+    this.showStreamReport = true;
+    this.enrichStreamReportWithAi(report);
+    this.runStreamShutdownInBackground('正在断开串流', async (): Promise<void> => {
+      await Promise.all([
+        this.lifecycleManager.stopBackgroundTask(),
+        this.viewModel.stopStreaming()
+      ]);
+    });
+  }
+
+  /**
+   * 退出游戏并返回（请求服务器退出当前游戏，显示串流战报后再返回列表）
+   */
+  async quitGameAndReturn(): Promise<void> {
+    if (this.pendingStreamShutdown) {
+      Logger.info('StreamPage', '[StreamPage] quitGameAndReturn 已在执行，忽略重复调用');
+      return;
+    }
+
+    this.stopClipboardSync();
+    this.touchInputHandler.cancelActiveInput();
+
+    const report = this.buildCurrentStreamReport();
+    await this.saveStreamDiagnostics(report.diagnosticsText);
+    this.prepareStreamEndUiImmediate();
+
+    if (!this.endStreamReportEnabled) {
+      await this.lifecycleManager.stopBackgroundTask();
+      await this.sendLockScreenShortcutBeforeDisconnect();
+      await this.exitStreamAndReturn();
+      this.runDetachedAsyncTask('后台退出游戏', (): Promise<void> => this.viewModel.quitGame());
+      return;
+    }
+
+    this.streamReportData = report.data;
+    this.streamDiagnosticsText = report.diagnosticsText;
+    this.showStreamReport = true;
+    this.enrichStreamReportWithAi(report);
+    this.runStreamShutdownInBackground('正在退出游戏', async (): Promise<void> => {
+      const stopBackgroundTaskPromise = this.lifecycleManager.stopBackgroundTask();
+      await this.sendLockScreenShortcutBeforeDisconnect();
+
+      await Promise.all([
+        stopBackgroundTaskPromise,
+        this.viewModel.quitGame()
+      ]);
+    });
+  }
+
+  /**
+   * 重连前问一次电脑端：未登录账号或账号不一致就不允许继续。
+   */
+  private async canReconnect(): Promise<boolean> {
+    try {
+      const info = ComputerManager.getInstance().getComputer(this.computerId);
+      let host: string = HOST_VIRTUAL_IP;
+      if (info !== undefined) {
+        const best: string = selectBestAddress(info);
+        if (best.length > 0) {
+          host = best;
+        } else if (info.address.length > 0) {
+          host = info.address;
+        }
+      }
+      const token: string = await AccountCenterService.getAccessTokenForGate();
+      const decision = await AccessGate.check(this.computerId, host, token);
+      Logger.info('StreamPage', `重连门禁: ok=${decision.ok} needCode=${decision.needCode} reason=${decision.reason}`);
+      return decision.ok;
+    } catch (err) {
+      Logger.warn('StreamPage', `重连门禁检查失败: ${(err as Error).message}`);
+      return false;
+    }
+  }
+
+  /**
+   * 重连串流（后台保活关闭时从后台恢复使用）
+   * 静默停止当前会话，然后重新启动串流，不导航离开页面
+   */
+  async reconnectStreaming(): Promise<void> {
+    Logger.info('StreamPage', '[StreamPage] 开始重连串流...');
+    // 重连也要过门禁：否则电脑端退出登录后，已打开的页面靠重连仍能继续控制
+    if (!(await this.canReconnect())) {
+      ToastQueue.show({ message: '电脑端当前不允许连接（未登录或账号不一致），已断开', duration: 3000 });
+      this.stopStreaming();
+      return;
+    }
+    try {
+      this.stopClipboardSync();
+
+      // 先停止当前会话（静默，不导航不显示 toast）
+      this.touchInputHandler.cancelActiveInput();
+      this.clearDs5TouchIndicators();
+      this.touchInputHandler.setDs5TouchpadSink(null);
+      this.touchInputHandler.setDs5TouchpadFeedbackCallback(null);
+      await this.viewModel.stopStreaming();
+      Logger.info('StreamPage', '[StreamPage] 旧会话已停止，开始重新连接...');
+
+      // 重新配置窗口和尺寸（与初次连接共用同一流程，避免画面缩小/黑边）
+      await this.configureStreamWindow();
+
+      // 关键：重新读取设置快照。隐私屏的「仅此屏」参数在 streamConfig 里，
+      // 它只在会话启动时加载一次，不刷新则菜单切换不会随重连生效。
+      await this.viewModel.loadSettings();
+
+      // 获取 surfaceId → 设置帧率 → 启动串流
+      await this.launchStream();
+      this.streamStartedAtMs = Date.now();
+      await this.startClipboardSync();
+      Logger.info('StreamPage', '[StreamPage] 重连串流成功');
+
+      ToastQueue.show({ message: '已重新连接' });
+    } catch (err) {
+      this.resetStreamFrameHints();
+      Logger.error('StreamPage', '[StreamPage] 重连串流失败:', err);
+      ToastQueue.show({ message: '重连失败，请手动重试' });
+    }
+  }
+
+  /** 读取全局隐私屏开关（菜单文案用） */
+  private async loadPrivacyState(): Promise<void> {
+    try {
+      const value = await PreferencesUtil.get<string | boolean>(SettingsKeys.PRIVACY_SCREEN_ENABLED, false);
+      this.privacyScreenEnabled = value === true || value === 'true';
+    } catch (err) {
+      Logger.warn('StreamPage', `读取隐私屏设置失败: ${(err as Error).message}`);
+    }
+  }
+
+  /**
+   * 串流菜单中切换隐私屏。
+   * 显示器拓扑只能在发起串流时指定，因此切换后必须断开重连才能生效。
+   */
+  private togglePrivacyFromMenu(): void {
+    const nextEnabled = !this.privacyScreenEnabled;
+    promptAction.showDialog({
+      title: nextEnabled ? '开启隐私屏？' : '关闭隐私屏？',
+      message: nextEnabled
+        ? '开启后需要重新连接：电脑屏幕将变黑，只有平板能看到画面。\n断开连接时电脑屏幕会自动恢复。'
+        : '关闭后需要重新连接：电脑屏幕将恢复显示，与平板同屏。',
+      buttons: [
+        { text: '取消', color: '#888888' },
+        { text: '切换并重连', color: '#1F8AFF' }
+      ]
+    }).then(async (res: promptAction.ShowDialogSuccessResponse) => {
+      if (res.index !== 1) {
+        return;
+      }
+      await PreferencesUtil.put(SettingsKeys.PRIVACY_SCREEN_ENABLED, nextEnabled);
+      this.privacyScreenEnabled = nextEnabled;
+      // 更新本次会话的显示器参数：开启→虚拟显示器；关闭→默认显示器
+      this.useVdd = nextEnabled;
+      this.displayGuid = '';
+      if (!nextEnabled) {
+        // 复位组合模式，避免下次普通串流残留「仅此屏」
+        await PreferencesUtil.put(SettingsKeys.SCREEN_COMBINATION_MODE, '主机默认');
+      }
+      ToastQueue.show({ message: nextEnabled ? '隐私屏已开启，正在重连…' : '隐私屏已关闭，正在重连…' });
+      await this.reconnectStreaming();
+    }).catch((err: Error) => {
+      Logger.warn('StreamPage', `切换隐私屏对话框异常: ${err.message}`);
+    });
+  }
+  
+  /**
+   * 发送超级指令 (Sunshine 功能)
+   */
+  async sendSuperCmd(cmdId: string): Promise<void> {
+    try {
+      const success = await this.viewModel.sendSuperCmd(cmdId);
+      if (success) {
+        ToastQueue.show({ message: '指令已发送' });
+      } else {
+        ToastQueue.show({ message: '指令发送失败' });
+      }
+    } catch (err) {
+      ToastQueue.show({ message: `指令发送失败: ${(err as Error).message}` });
+    }
+  }
+
+  /**
+   * 执行快捷键（支持单次组合或多步序列）
+   */
+  sendShortcut(shortcut: Shortcut): void {
+    const session = this.viewModel.getSession();
+    if (!session) return;
+    sendShortcutKeys((keys: number[]) => session.sendKeys(keys), shortcut.keys, shortcut.keySequence);
+  }
+
+  /**
+   * 处理触摸事件
+   */
+  handleTouch(event: TouchEvent): void {
+    if (!this.viewModel.isConnected) {
+      return;
+    }
+    // 虚拟手柄显示时，默认不处理触摸输入（避免与虚拟按键手势竞争）
+    // touchPassthrough 开启时允许共存
+    if (this.viewModel.showController && !this.touchPassthrough &&
+      this.viewModel.touchMode !== TouchMode.DS5_TOUCHPAD) {
+      return;
+    }
+    this.touchInputHandler.handleTouchEvent(event);
+  }
+
+  private handleDs5TouchpadFeedback(feedback: Ds5TouchpadFeedback): void {
+    if (feedback.type === DS5_TOUCH_FEEDBACK_CANCEL) {
+      this.clearDs5TouchIndicators();
+      return;
+    }
+
+    if (feedback.pointerId < 0) return;
+    // pointerId 可能被复用：新触点激活时取消旧的淡出移除定时器，
+    // 否则 140ms 后活跃触点会被旧定时器误删。
+    if (feedback.type === DS5_TOUCH_FEEDBACK_DOWN ||
+      feedback.type === DS5_TOUCH_FEEDBACK_MOVE ||
+      feedback.type === DS5_TOUCH_FEEDBACK_CLICK_DOWN) {
+      const pending = this.ds5TouchFadeTimers.get(feedback.pointerId);
+      if (pending !== undefined) {
+        clearTimeout(pending);
+        this.ds5TouchFadeTimers.delete(feedback.pointerId);
+      }
+    }
+    const current = this.ds5TouchIndicators;
+    let found = false;
+    const next: Ds5TouchIndicator[] = [];
+    for (let i = 0; i < current.length; i++) {
+      const indicator = current[i];
+      if (indicator.pointerId !== feedback.pointerId) {
+        next.push(indicator);
+        continue;
+      }
+
+      found = true;
+      const updated: Ds5TouchIndicator = {
+        pointerId: indicator.pointerId,
+        x: feedback.x,
+        y: feedback.y,
+        contactActive: indicator.contactActive,
+        clickPressed: indicator.clickPressed,
+        opacity: 1,
+        scale: 1
+      };
+      if (feedback.type === DS5_TOUCH_FEEDBACK_DOWN ||
+        feedback.type === DS5_TOUCH_FEEDBACK_MOVE) {
+        updated.contactActive = true;
+        updated.clickPressed = false;
+      } else if (feedback.type === DS5_TOUCH_FEEDBACK_UP) {
+        updated.contactActive = false;
+        updated.scale = 0.82;
+        updated.opacity = 0.82;
+      } else if (feedback.type === DS5_TOUCH_FEEDBACK_CLICK_DOWN) {
+        updated.clickPressed = true;
+        updated.scale = 1.12;
+      } else if (feedback.type === DS5_TOUCH_FEEDBACK_CLICK_UP) {
+        updated.clickPressed = false;
+        updated.contactActive = false;
+        updated.scale = 0.78;
+        updated.opacity = 0.72;
+      }
+      next.push(updated);
+    }
+
+    if (!found && (feedback.type === DS5_TOUCH_FEEDBACK_DOWN ||
+      feedback.type === DS5_TOUCH_FEEDBACK_CLICK_DOWN)) {
+      const created: Ds5TouchIndicator = {
+        pointerId: feedback.pointerId,
+        x: feedback.x,
+        y: feedback.y,
+        contactActive: feedback.type === DS5_TOUCH_FEEDBACK_DOWN,
+        clickPressed: feedback.type === DS5_TOUCH_FEEDBACK_CLICK_DOWN,
+        opacity: 1,
+        scale: feedback.type === DS5_TOUCH_FEEDBACK_CLICK_DOWN ? 1.12 : 1
+      };
+      next.push(created);
+    }
+
+    this.ds5TouchIndicators = next;
+    let shouldScheduleRemoval = feedback.type === DS5_TOUCH_FEEDBACK_CLICK_UP;
+    if (feedback.type === DS5_TOUCH_FEEDBACK_UP) {
+      for (let i = 0; i < this.ds5TouchIndicators.length; i++) {
+        const indicator = this.ds5TouchIndicators[i];
+        if (indicator.pointerId === feedback.pointerId && !indicator.clickPressed) {
+          shouldScheduleRemoval = true;
+          break;
+        }
+      }
+    }
+    if (shouldScheduleRemoval) {
+      this.scheduleDs5TouchIndicatorRemoval(feedback.pointerId);
+    }
+  }
+
+  private scheduleDs5TouchIndicatorRemoval(pointerId: number): void {
+    const previous = this.ds5TouchFadeTimers.get(pointerId);
+    if (previous !== undefined) clearTimeout(previous);
+    const timer = setTimeout(() => {
+      this.ds5TouchIndicators = this.ds5TouchIndicators.filter(
+        (indicator: Ds5TouchIndicator): boolean => indicator.pointerId !== pointerId
+      );
+      this.ds5TouchFadeTimers.delete(pointerId);
+    }, 140);
+    this.ds5TouchFadeTimers.set(pointerId, timer);
+  }
+
+  private clearDs5TouchIndicators(): void {
+    this.ds5TouchFadeTimers.forEach((timer: number): void => {
+      clearTimeout(timer);
+    });
+    this.ds5TouchFadeTimers.clear();
+    this.ds5TouchIndicators = [];
+  }
+
+  /**
+   * 处理本地系统触摸手势。
+   *
+   * 启用三指输入法手势后，三指同时触摸用于唤出 HarmonyOS IME，
+   * 优先于远端触摸输入和双指缩放。
+   * 触发后持续吞掉本组三指，避免远端收到半截多指触摸或鼠标拖拽。
+   */
+  private handleSystemTouchGesture(event: TouchEvent): boolean {
+    const enableThreeFingerIme = this.viewModel.inputSettings?.enableThreeFingerIme ?? true;
+    const result = this.threeFingerImeGestureHandler.handleTouchEvent(
+      event, enableThreeFingerIme && this.viewModel.isConnected);
+    if (result === ThreeFingerImeGestureResult.TRIGGERED) {
+      this.touchInputHandler.cancelActiveInput();
+      this.panZoomHandler.cancelActiveGesture();
+      if (this.showKeyboardPanel) {
+        // 三指再次触发时主动关闭；hide() 会同步解除锁定。
+        this.imeManager.hide();
+      } else {
+        this.showVirtualKeyboard = false;
+        // 三指呼出的 IME 默认锁定：画面失焦事件只能触发重新显示，
+        // 仅再次三指或工具条关闭按钮可以主动关闭。
+        this.imePanelLocked = true;
+        this.imeManager.setLocked(true);
+        this.imeManager.show();
+      }
+    }
+    return result !== ThreeFingerImeGestureResult.PASS_THROUGH;
+  }
+
+  /**
+   * 设置触摸模式
+   */
+  setTouchMode(mode: string): void {
+    const nextMode = mode as TouchMode;
+    if (nextMode === TouchMode.DS5_TOUCHPAD && this.viewModel.isConnected &&
+      !this.viewModel.isDs5TouchpadSupported()) {
+      ToastQueue.show({ message: '主机未启用 DS5 触控板协议', duration: 2200 });
+      return;
+    }
+
+    this.touchInputHandler.cancelActiveInput();
+    this.clearDs5TouchIndicators();
+    if (nextMode === TouchMode.DS5_TOUCHPAD && this.isTouchOverrideEnabled) {
+      this.isTouchOverrideEnabled = false;
+      this.panZoomHandler.cancelActiveGesture();
+    }
+    this.viewModel.setTouchMode(nextMode);
+    this.touchInputHandler.setMode(this.toTouchInputMode(nextMode));
+    Logger.info('StreamPage', `StreamPage: 触摸模式切换为 ${mode}`);
+  }
+
+  private toTouchInputMode(mode: TouchMode): TouchInputMode {
+    switch (mode) {
+      case TouchMode.DIRECT:
+        return TouchInputMode.DIRECT;
+      case TouchMode.MOUSE:
+        return TouchInputMode.MOUSE;
+      case TouchMode.DS5_TOUCHPAD:
+        return TouchInputMode.DS5_TOUCHPAD;
+      case TouchMode.TRACKPAD:
+      default:
+        return TouchInputMode.TRACKPAD;
+    }
+  }
+  
+  /**
+   * 强制切换到 USB 驱动模式
+   */
+  async forceUsbDriverMode(): Promise<void> {
+    try {
+      const success = await this.gamepadManager.forceUsbDriverMode();
+      if (success) {
+        const modeDesc = this.gamepadManager.getInputModeDescription();
+        ToastQueue.show({ 
+          message: `已切换到: ${modeDesc}`,
+          duration: 3000
+        });
+        Logger.info('StreamPage', `StreamPage: 已切换输入模式 -> ${modeDesc}`);
+      } else {
+        ToastQueue.show({ 
+          message: '切换失败，请重试',
+          duration: 2000
+        });
+      }
+    } catch (err) {
+      Logger.error('StreamPage', '强制 USB 驱动模式切换失败:', err);
+      ToastQueue.show({ 
+        message: '切换失败: ' + (err as Error).message,
+        duration: 2000
+      });
+    }
+  }
+
+  build() {
+    NavDestination() {
+    Stack() {
+      // 视频渲染层 — 包裹在独立 Stack 中实现 9 宫格定位 + 偏移
+      Stack() {
+        XComponent({
+          id: 'streamSurface',
+          type: XComponentType.SURFACE,
+          controller: this.xComponentController
+        })
+          .onLoad(() => {
+            Logger.info('StreamPage', 'XComponent 加载完成');
+            this.startStreaming();
+          })
+          .onDestroy(() => {
+            Logger.info('StreamPage', 'XComponent 销毁');
+          })
+          .width(this.xComponentWidth)
+          .height(this.xComponentHeight)
+          .offset({ x: this.xComponentOffsetX, y: this.xComponentOffsetY })
+          .attributeModifier(this.aihdrModifier)
+          .hitTestBehavior((this.viewModel.showController && !this.touchPassthrough &&
+            this.viewModel.touchMode !== TouchMode.DS5_TOUCHPAD)
+            ? HitTestMode.None : HitTestMode.Default)
+          .onTouch((event: TouchEvent) => {
+            // 过滤鼠标源触摸事件：物理鼠标点击会同时触发 .onMouse 和 .onTouch，
+            // 鼠标事件已在 .onMouse 中处理，此处跳过避免重复发送为触摸
+            if (event.source === SourceType.Mouse) return;
+            if (this.handleSystemTouchGesture(event)) return;
+            // 双指缩放模式：触摸事件完全由 PanZoomHandler 消费
+            if (this.isTouchOverrideEnabled) {
+              this.panZoomHandler.handleTouchEvent(event);
+              return;
+            }
+            this.handleTouch(event);
+          })
+          .onMouse((event: MouseEvent) => {
+            // 物理鼠标事件处理 → 委托给输入处理器
+            this.inputHandler.handleMouseEvent(event);
+          })
+          .onAxisEvent((event: AxisEvent) => {
+            // 鼠标滚轮事件处理 → 委托给输入处理器
+            this.inputHandler.handleAxisEvent(event);
+          })
+          .onAreaChange((_oldArea: Area, newArea: Area) => {
+            // 更新 XComponent 实际渲染尺寸（窗口模式下 '100%' 的实际 vp 值）
+            const w = newArea.width as number;
+            const h = newArea.height as number;
+            if (w > 0 && h > 0) {
+              this.xComponentActualWidthVp = w;
+              this.xComponentActualHeightVp = h;
+              this.inputHandler.updateXComponentActualSize(w, h);
+            }
+            // 获取 XComponent 在屏幕上的精确位置，用于绝对模式鼠标坐标转换
+            const globalPos = newArea.globalPosition;
+            if (globalPos) {
+              const screenX = globalPos.x as number;
+              const screenY = globalPos.y as number;
+              this.inputHandler.updateXComponentScreenPosition(screenX, screenY);
+            }
+          })
+      }
+      .width('100%')
+      .height('100%')
+      .alignContent(this.xComponentAlignment)
+      .clip(true)
+      .onAreaChange((_oldArea: Area, newArea: Area) => {
+        const w = newArea.width as number;
+        const h = newArea.height as number;
+        void this.handleVideoViewportAreaChange(w, h);
+      })
+      .scale({
+        x: this.videoScale,
+        y: this.videoScale,
+        centerX: 0,
+        centerY: 0
+      })
+      .translate({
+        x: this.videoTranslateX,
+        y: this.videoTranslateY
+      })
+
+      // 连接状态层
+      if (this.viewModel.isConnecting) {
+        this.ConnectingOverlay()
+      }
+
+      // 错误提示层
+      if (this.viewModel.hasError) {
+        Column() {
+          this.ErrorOverlay()
+        }
+        .width('100%')
+        .alignItems(HorizontalAlign.Center)
+        .position({ bottom: 48 })
+        .hitTestBehavior(HitTestMode.Transparent)
+      }
+
+      // 网络质量警告层（对齐 Android connectionStatusUpdate 行为）
+      if (this.viewModel.isConnected && this.connectionPoor) {
+        Column() {
+          this.ConnectionWarningOverlay()
+        }
+        .width('100%')
+        .alignItems(HorizontalAlign.Center)
+        .position({ bottom: 48 })
+        .hitTestBehavior(HitTestMode.None)
+      }
+
+      // 性能监控层
+      if (this.viewModel.isConnected && this.viewModel.showOverlay) {
+        PerformanceOverlay({
+          viewModel: this.viewModel,
+          screenWidth: this.viewModel.displayInfo.screenWidth,
+          screenHeight: this.viewModel.displayInfo.screenHeight
+        })
+      }
+
+      // 虚拟控制器层
+      if (this.viewModel.isConnected && this.viewModel.showController) {
+        VirtualControllerOverlay({
+          touchPassthrough: $touchPassthrough,
+          controllerScale: $controllerScaleValue,
+          controllerOpacity: $controllerOpacityValue,
+          onlyL3R3: this.viewModel.inputSettings?.onlyL3R3 ?? false,
+          showGuideButton: this.viewModel.inputSettings?.showGuideButton ?? true,
+          vibrateOsc: this.viewModel.inputSettings?.vibrateOsc ?? true,
+          halfHeightPortrait: this.viewModel.inputSettings?.halfHeightOscPortrait ?? true,
+          onInput: (input) => {
+            this.viewModel.sendInput(input);
+          },
+          onSystemTouchGesture: (event: TouchEvent): boolean => {
+            return this.handleSystemTouchGesture(event);
+          }
+        })
+      }
+
+      // DS5 触控板本地回显层：只画触点，不拦截后续触摸。
+      if (this.viewModel.isConnected && this.viewModel.touchMode === TouchMode.DS5_TOUCHPAD &&
+        this.ds5TouchIndicators.length > 0) {
+        this.Ds5TouchpadFeedbackOverlay()
+      }
+
+      // 自定义按键覆盖层
+      if (this.showCustomKeys && this.viewModel.isConnected) {
+        Column() {
+          CustomKeyOverlay({
+            editMode: $customKeyEditMode,
+            profileVersion: this.customKeyProfileVersion,
+            onKeyAction: (action: KeyAction, isDown: boolean): void => {
+              this.customKeyManager?.handleAction(action, isDown);
+            },
+            onAnalogStickMovement: (stick: string, x: number, y: number): void => {
+              this.customKeyManager?.handleAnalogStickMovement(stick, x, y);
+            },
+            onAnalogStickClick: (stick: string): void => {
+              this.customKeyManager?.handleAnalogStickClick(stick);
+            },
+            onDPadDirectionChange: (direction: number): void => {
+              this.customKeyManager?.handleDPadDirectionChange(direction);
+            },
+            onEditModeChanged: (editing: boolean): void => {
+              this.customKeyEditMode = editing;
+            },
+            onProfileSwitched: (): void => {
+              this.customKeyProfileVersion++;
+              // 保存游戏→配置关联
+              if (this.appId > 0) {
+                CustomKeyStore.getActiveProfileName().then((name) => {
+                  CustomKeyStore.setGameProfile(this.appId, name);
+                });
+              }
+            },
+            onAiRecommend: async (gameName: string): Promise<AiKeyRecommendation> => {
+              if (!this.aiKeyService) {
+                throw new Error('AI 服务不可用（未连接到 Sunshine）');
+              }
+              return this.aiKeyService.getRecommendation(gameName);
+            },
+          })
+        }
+          .width('100%')
+          .height('100%')
+          // 编辑模式: Default — 子组件正常交互，不穿透到游戏流
+          // 游玩模式: Transparent — 空白区域穿透给 XComponent（按键自身 Block 阻断）
+          .hitTestBehavior(this.customKeyEditMode ? HitTestMode.Default : HitTestMode.Transparent)
+          .opacity(this.customKeyHitReady > 0 ? 1 : 0.99) // 父层刷新命中测试区域
+      }
+
+      // 右侧边缘串流工具条入口（轻点呼出抽屉；返回键仍可用）
+      if (this.viewModel.isConnected && !this.showStreamReport) {
+        this.StreamMenuTrigger()
+      }
+
+      // 系统键盘输入面板
+      if (this.showKeyboardPanel) {
+        this.KeyboardInputPanel()
+      }
+
+      // PC 虚拟键盘
+      if (this.showVirtualKeyboard && this.viewModel.isConnected) {
+        VirtualKeyboard({
+          onVirtualKeyEvent: (vk: number, isDown: boolean): void => {
+            const session = this.viewModel.getSession();
+            if (session) {
+              session.sendKeyboardInput(vk, isDown ? 0x03 : 0x04);
+            }
+          },
+          onClose: (): void => {
+            this.showVirtualKeyboard = false;
+          },
+        })
+      }
+
+      // 串流结束战报层（停止 session 后仍留在当前页，用户关闭后再返回）
+      if (this.showStreamReport) {
+        StreamSessionReport({
+          data: this.streamReportData,
+          diagnosticsText: this.streamDiagnosticsText,
+          onClose: (): void => {
+            this.closeStreamReportAndReturn();
+          }
+        })
+      }
+
+    }
+    .width('100%')
+    .height('100%')
+    .backgroundColor(Color.Black)
+    .focusable(true)
+    .defaultFocus(true)
+    .onKeyEvent((event: KeyEvent) => {
+      return this.inputHandler.handleKeyEvent(event);
+    })
+    }
+    .hideTitleBar(true)
+    .onBackPressed(() => this.onBackPress())
+  }
+
+  // ==================== UI Builders ====================
+
+  /**
+   * 串流画面右侧边缘的工具条入口。
+   * 只占 26vp 宽的一小条，不挡画面也不挡触控；点一下打开串流抽屉。
+   */
+  @Builder
+  StreamMenuTrigger() {
+    Column({ space: 5 }) {
+      Circle().width(4).height(4).fill('#E6FFFFFF')
+      Circle().width(4).height(4).fill('#E6FFFFFF')
+      Circle().width(4).height(4).fill('#E6FFFFFF')
+    }
+    .width(26)
+    .height(76)
+    .justifyContent(FlexAlign.Center)
+    .backgroundColor('#59000000')
+    .borderRadius({ topLeft: 13, bottomLeft: 13 })
+    .border({ width: { left: 1 }, color: '#33FFFFFF' })
+    .position({ x: '100%', y: '50%' })
+    .translate({ x: '-100%', y: '-50%' })
+    .onClick(() => this.showStreamMenu())
+  }
+
+  @Builder
+  Ds5TouchpadFeedbackOverlay() {
+    Stack() {
+      ForEach(this.ds5TouchIndicators, (indicator: Ds5TouchIndicator) => {
+        Stack() {
+          Circle()
+            .width(42)
+            .height(42)
+            .fill(indicator.clickPressed ? '#45FFD166' : '#24FFFFFF')
+            .border({
+              width: indicator.clickPressed ? 2.5 : 1.5,
+              color: indicator.clickPressed ? '#FFF4C15D' : '#CCFFFFFF'
+            })
+          Circle()
+            .width(indicator.clickPressed ? 8 : 5)
+            .height(indicator.clickPressed ? 8 : 5)
+            .fill(indicator.clickPressed ? '#FFFFD166' : '#E6FFFFFF')
+        }
+          .width(42)
+          .height(42)
+          .position({
+            x: (indicator.x * 100) + '%',
+            y: (indicator.y * 100) + '%'
+          })
+          .translate({
+            x: -21,
+            y: -21
+          })
+          .opacity(indicator.opacity)
+          .scale({
+            x: indicator.scale,
+            y: indicator.scale
+          })
+          .hitTestBehavior(HitTestMode.None)
+      }, (indicator: Ds5TouchIndicator): string => String(indicator.pointerId))
+    }
+      .width(this.xComponentWidth)
+      .height(this.xComponentHeight)
+      .alignContent(this.xComponentAlignment)
+      .offset({ x: this.xComponentOffsetX, y: this.xComponentOffsetY })
+      .scale({
+        x: this.videoScale,
+        y: this.videoScale,
+        centerX: 0,
+        centerY: 0
+      })
+      .translate({
+        x: this.videoTranslateX,
+        y: this.videoTranslateY
+      })
+      .clip(true)
+      .hitTestBehavior(HitTestMode.None)
+  }
+
+  @Builder
+  KeyboardInputPanel() {
+    // 紧贴 IME 上方的浮动工具条：快捷键 + 服务端指令 + 主机键盘
+    Column({ space: 0 }) {
+      // 横向滚动工具条
+      Scroll() {
+        Row({ space: 6 }) {
+          // ── 键盘指示 + 主机键盘 ──
+          Image($r('app.media.ic_keyboard'))
+            .width(17)
+            .height(17)
+            .fillColor('#D0FFFFFF')
+
+          Button('主机键盘')
+            .fontSize(11)
+            .fontColor('#FFFFFF')
+            .backgroundColor('#3B82F6')
+            .height(26)
+            .borderRadius(13)
+            .padding({ left: 10, right: 10 })
+            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
+            .onClick(() => {
+              this.viewModel.getSession()?.sendKeys([VirtualKey.VK_LWIN, VirtualKey.VK_CONTROL, VirtualKey.VK_O]);
+              this.imeManager.hide();
+            })
+
+          // ── 切换到虚拟键盘 ──
+          Button('虚拟键盘')
+            .fontSize(11)
+            .fontColor('#FFFFFF')
+            .backgroundColor('#8B5CF6')
+            .height(26)
+            .borderRadius(13)
+            .padding({ left: 10, right: 10 })
+            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
+            .onClick(() => {
+              this.imeManager.hide();
+              this.showVirtualKeyboard = true;
+            })
+
+          Divider()
+            .vertical(true)
+            .height(16)
+            .color('#33FFFFFF')
+            .strokeWidth(1)
+
+          // ── 快捷键按钮（与菜单卡片中 ShortcutPill 一致的颜色方案）──
+          ForEach(this.shortcutManager.getShortcuts(), (shortcut: Shortcut) => {
+            Row() {
+              if (shortcut.icon) {
+                Text(shortcut.icon)
+                  .fontSize(11)
+                  .margin({ right: 3 })
+              }
+              Text(shortcut.name)
+                .fontSize(11)
+                .fontColor('#F0FFFFFF')
+            }
+            .padding({ left: 10, right: 10, top: 4, bottom: 4 })
+            .backgroundColor(`#50${(shortcut.color || '#9DABB2').replace('#', '')}`)
+            .border({ width: 1, color: `#80${(shortcut.color || '#9DABB2').replace('#', '')}` })
+            .borderRadius(13)
+            .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
+            .onClick(() => {
+              this.sendShortcut(shortcut);
+            })
+          }, (shortcut: Shortcut) => shortcut.id)
+
+          // ── 服务端指令按钮 ──
+          if (this.cmdList.length > 0) {
+            Divider()
+              .vertical(true)
+              .height(16)
+              .color('#33FFFFFF')
+              .strokeWidth(1)
+
+            ForEach(this.cmdList, (cmd: SuperCmd) => {
+              Row() {
+                Image($r('app.media.ic_lightning'))
+                  .width(11)
+                  .height(11)
+                  .fillColor('#F0FFFFFF')
+                  .margin({ right: 3 })
+                Text(cmd.name)
+                  .fontSize(11)
+                  .fontColor('#F0FFFFFF')
+              }
+              .padding({ left: 10, right: 10, top: 4, bottom: 4 })
+              .backgroundColor('#50D97706')
+              .border({ width: 1, color: '#80D97706' })
+              .borderRadius(13)
+              .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.9 })
+              .onClick(() => {
+                this.sendSuperCmd(cmd.id);
+              })
+            }, (cmd: SuperCmd) => cmd.id)
+          }
+        }
+      }
+      .scrollable(ScrollDirection.Horizontal)
+      .scrollBar(BarState.Off)
+      .layoutWeight(1)
+      .align(Alignment.Start)
+      .padding({ left: 14, right: 16 })
+      .fadingEdge(true, { fadingEdgeLength: LengthMetrics.vp(20) })
+    }
+    .direction(Direction.Ltr)
+    .width('100%')
+    .height(40)
+    .backgroundColor('#CC1A1A2E')
+    .backdropBlur(40)
+    .borderRadius({ topLeft: 16, topRight: 16 })
+    .shadow({ radius: 12, color: '#40000000', offsetY: -2 })
+    .position({ left: 0, bottom: this.keyboardHeight })
+
+    // 右上角关闭按钮（悬浮在工具条上方）
+    Text('✕')
+      .fontSize(13)
+      .fontColor('#99FFFFFF')
+      .width(24)
+      .height(24)
+      .textAlign(TextAlign.Center)
+      .borderRadius(12)
+      .backgroundColor('#661A1A2E')
+      .backdropBlur(20)
+      .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.85 })
+      .onClick(() => {
+        this.imeManager.hide();
+      })
+      .position({ right: 8, bottom: this.keyboardHeight + 44 })
+
+    // 锁定按钮（紧邻 ✕ 左侧）：开启后点击其他区域不会收回 IME / 工具条；✕ 仍可关闭
+    Text(this.imePanelLocked ? '🔒' : '🔓')
+      .fontSize(12)
+      .fontColor(this.imePanelLocked ? '#A8D8EA' : '#99FFFFFF')
+      .width(24)
+      .height(24)
+      .textAlign(TextAlign.Center)
+      .borderRadius(12)
+      .backgroundColor(this.imePanelLocked ? '#66395A78' : '#661A1A2E')
+      .backdropBlur(20)
+      .clickEffect({ level: ClickEffectLevel.LIGHT, scale: 0.85 })
+      .onClick(() => {
+        this.imePanelLocked = !this.imePanelLocked;
+        this.imeManager.setLocked(this.imePanelLocked);
+      })
+      .position({ right: 38, bottom: this.keyboardHeight + 44 })
+  }
+
+  @Builder
+  ConnectionWarningOverlay() {
+    Row({ space: 8 }) {
+      Text('⚠')
+        .fontSize(16)
+        .fontColor('#FFFFB74D')
+      Text(this.viewModel.streamConfig && this.viewModel.streamConfig.bitrate > 5000
+        ? '网速慢，请尝试降低码率或使用有线连接'
+        : '网络连接不稳定')
+        .fontSize(13)
+        .fontColor('#EEFFFFFF')
+    }
+    .padding({ left: 16, right: 16, top: 10, bottom: 10 })
+    .borderRadius(20)
+    .backgroundColor('#B01A1A2E')
+    .backdropBlur(30)
+    .border({ width: 1, color: '#18FFFFFF' })
+    .shadow({ radius: 12, color: '#40000000', offsetY: 4 })
+    .hitTestBehavior(HitTestMode.None)
+    .transition(TransitionEffect.OPACITY.animation({ duration: 300 }))
+  }
+
+  @Builder
+  ConnectingOverlay() {
+    Stack() {
+      // 1) 海报背景层：优先 app 封面；从 PcCard 直接串流时 fallback 到 PcView 背景壁纸；都没有就纯黑
+      if (this.posterPath.length > 0) {
+        Image(`file://${this.posterPath}`)
+          .width('100%')
+          .height('100%')
+          .objectFit(ImageFit.Cover)
+          .blur(40)
+          .opacity(0.55)
+      } else if (this.globalBgUrl.length > 0) {
+        Image(this.globalBgUrl)
+          .width('100%')
+          .height('100%')
+          .objectFit(ImageFit.Cover)
+          .blur(40)
+          .opacity(0.45)
+      }
+      // 2) 渐变暗化层（顶部和底部更暗，居中信息可读性更高）
+      Column()
+        .width('100%')
+        .height('100%')
+        .linearGradient({
+          angle: 180,
+          colors: [
+            ['rgba(0,0,0,0.85)', 0.0],
+            ['rgba(0,0,0,0.55)', 0.5],
+            ['rgba(0,0,0,0.92)', 1.0]
+          ]
+        })
+
+      // 3) 信息层
+      Column() {
+        // 应用名（如果有）
+        if (this.appName.length > 0) {
+          Text(this.appName)
+            .fontSize(20)
+            .fontWeight(FontWeight.Medium)
+            .fontColor('#FFFFFFFF')
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .margin({ bottom: 32 })
+            .constraintSize({ maxWidth: 360 })
+            .textAlign(TextAlign.Center)
+        }
+
+        LoadingProgress()
+          .width(48)
+          .height(48)
+          .color(Color.White)
+
+        Text(this.viewModel.connectionStageText || '正在连接...')
+          .fontSize(14)
+          .fontColor('#E0FFFFFF')
+          .margin({ top: 16 })
+          .textAlign(TextAlign.Center)
+          .transition(TransitionEffect.OPACITY.animation({ duration: 200 }))
+
+        // 小课堂提示（仅在有 tip 时显示，控制最大宽度）
+        if (this.connectingTip.length > 0) {
+          Text(this.connectingTip)
+            .fontSize(12)
+            .fontColor('#99FFFFFF')
+            .margin({ top: 28 })
+            .padding({ left: 28, right: 28 })
+            .textAlign(TextAlign.Center)
+            .maxLines(3)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .constraintSize({ maxWidth: 460 })
+            .lineHeight(18)
+        }
+      }
+      .width('100%')
+      .height('100%')
+      .justifyContent(FlexAlign.Center)
+      .alignItems(HorizontalAlign.Center)
+    }
+    .width('100%')
+    .height('100%')
+    // 淡出 + 轻微放大消失，让"已连接 → 首帧"之间不再瞬间黑切。
+    // 进入时用瞬时显现（appear: identity），离开时 320ms ease-out 淡到 0 + scale 1.04
+    .transition(TransitionEffect.asymmetric(
+      TransitionEffect.IDENTITY,
+      TransitionEffect.OPACITY.combine(
+        TransitionEffect.scale({ x: 1.04, y: 1.04 })
+      ).animation({ duration: 320, curve: Curve.EaseOut })
+    ))
+  }
+
+  @Builder
+  ErrorOverlay() {
+    Column({ space: 12 }) {
+      Row({ space: 8 }) {
+        Text('✕')
+          .fontSize(16)
+          .fontColor('#FFEF5350')
+        Text(this.viewModel.errorMessage)
+          .fontSize(13)
+          .fontColor('#EEFFFFFF')
+          .constraintSize({ maxWidth: 280 })
+          .maxLines(3)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+      }
+
+      Text('返回')
+        .fontSize(12)
+        .fontColor('#EEFFFFFF')
+        .padding({ left: 20, right: 20, top: 6, bottom: 6 })
+        .borderRadius(14)
+        .backgroundColor('#30FFFFFF')
+        .onClick(() => {
+          AppNav.pop();
+        })
+    }
+    .padding({ left: 20, right: 20, top: 14, bottom: 14 })
+    .borderRadius(20)
+    .backgroundColor('#B01A1A2E')
+    .backdropBlur(30)
+    .border({ width: 1, color: '#18FFFFFF' })
+    .shadow({ radius: 12, color: '#40000000', offsetY: 4 })
+    .transition(TransitionEffect.OPACITY.animation({ duration: 300 }))
+  }
+}
+
+@Builder
+export function StreamPageBuilder() {
+  StreamPage()
+}

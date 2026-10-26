@@ -1,0 +1,268 @@
+/*
+ * Moonlight for HarmonyOS
+ * Copyright (C) 2024-2025 Moonlight/AlkaidLab
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ */
+
+import { mdns } from '@kit.NetworkKit';
+import { common } from '@kit.AbilityKit';
+import { BusinessError } from '@kit.BasicServicesKit';
+import { NvHttp } from '../streaming/NvHttp';
+import { Logger } from '../../common/Logger';
+
+/**
+ * 发现的计算机信息
+ */
+export interface DiscoveredComputer {
+  name: string;           // 主机名
+  address: string;        // IP 地址
+  port: number;           // 服务端口
+  ipv6Address?: string;   // IPv6 地址（可选）
+}
+
+/**
+ * mDNS 服务发现
+ *
+ * 用于在局域网内发现运行 NVIDIA GameStream / Sunshine 的主机
+ * 参考 Android 版本的 NsdManagerDiscoveryAgent 实现
+ */
+export class MdnsDiscovery {
+  private static readonly SERVICE_TYPE = '_nvstream._tcp';
+  private static readonly DISCOVERY_TIMEOUT = 5000;  // 5秒超时
+
+  private discoveryService: mdns.DiscoveryService | null = null;
+  private discoveredComputers: Map<string, DiscoveredComputer> = new Map();
+  private isDiscovering: boolean = false;
+  private disposed: boolean = false;
+  private context: common.Context;
+  private onComputerFound: ((computer: DiscoveredComputer) => void) | null = null;
+
+  constructor(context: common.Context) {
+    this.context = context;
+  }
+
+  /**
+   * 设置计算机发现回调
+   */
+  setOnComputerFoundListener(callback: (computer: DiscoveredComputer) => void): void {
+    this.onComputerFound = callback;
+  }
+
+  /**
+   * 开始发现局域网内的主机
+   */
+  async startDiscovery(): Promise<void> {
+    if (this.isDiscovering) {
+      Logger.info('MdnsDiscovery', 'MdnsDiscovery: 已经在发现中');
+      return;
+    }
+
+    this.isDiscovering = true;
+    this.disposed = false;
+    this.discoveredComputers.clear();
+
+    Logger.info('MdnsDiscovery', `MdnsDiscovery: 开始发现服务类型 ${MdnsDiscovery.SERVICE_TYPE}`);
+
+    try {
+      // 创建 mDNS 发现服务
+      this.discoveryService = mdns.createDiscoveryService(
+        this.context,
+        MdnsDiscovery.SERVICE_TYPE
+      );
+      Logger.info('MdnsDiscovery', 'MdnsDiscovery: 发现服务已创建');
+
+      // 监听服务发现事件（参考 moonlight-ohos 使用 async 回调）
+      this.discoveryService.on('serviceFound', async (serviceInfo: mdns.LocalServiceInfo) => {
+        Logger.info('MdnsDiscovery', `MdnsDiscovery: [serviceFound] 原始信息: ${JSON.stringify(serviceInfo)}`);
+        try {
+          // 解析服务以获取完整信息（参考 moonlight-ohos）
+          const resolvedInfo = await mdns.resolveLocalService(this.context, serviceInfo);
+          Logger.info('MdnsDiscovery', `MdnsDiscovery: [serviceFound] 解析后: ${JSON.stringify(resolvedInfo)}`);
+          await this.handleResolvedService(resolvedInfo);
+        } catch (err) {
+          Logger.error('MdnsDiscovery', `MdnsDiscovery: [serviceFound] 解析失败: ${err}`);
+        }
+      });
+
+      // 监听服务丢失事件
+      this.discoveryService.on('serviceLost', async (serviceInfo: mdns.LocalServiceInfo) => {
+        Logger.info('MdnsDiscovery', `MdnsDiscovery: [serviceLost] ${serviceInfo.serviceName}`);
+        try {
+          const resolvedInfo = await mdns.resolveLocalService(this.context, serviceInfo);
+          this.discoveredComputers.delete(resolvedInfo.serviceName);
+        } catch (err) {
+          // 服务丢失时可能无法解析，直接使用原始名称
+          this.discoveredComputers.delete(serviceInfo.serviceName);
+        }
+      });
+
+      // 监听 discoveryStart 事件
+      this.discoveryService.on('discoveryStart', (info: mdns.DiscoveryEventInfo) => {
+        Logger.info('MdnsDiscovery', `MdnsDiscovery: 发现已开始 - ${JSON.stringify(info)}`);
+        // 检查是否有错误码（参考 moonlight-ohos 实现）
+        if (info.errorCode !== undefined && info.errorCode !== 0) {
+          Logger.error('MdnsDiscovery', `MdnsDiscovery: 发现启动失败，错误码: ${info.errorCode}`);
+          this.isDiscovering = false;
+          this.discoveryService?.stopSearchingMDNS();
+        }
+      });
+
+      // 监听 discoveryStop 事件
+      this.discoveryService.on('discoveryStop', (info: mdns.DiscoveryEventInfo) => {
+        Logger.info('MdnsDiscovery', `MdnsDiscovery: 发现已停止 - ${JSON.stringify(info)}`);
+      });
+
+      // 开始搜索
+      Logger.info('MdnsDiscovery', 'MdnsDiscovery: 调用 startSearchingMDNS()');
+      this.discoveryService.startSearchingMDNS();
+      Logger.info('MdnsDiscovery', 'MdnsDiscovery: startSearchingMDNS() 已调用');
+
+    } catch (err) {
+      const error = err as BusinessError;
+      Logger.error('MdnsDiscovery', `MdnsDiscovery: 启动发现失败 - ${error.code}: ${error.message}`);
+      this.isDiscovering = false;
+      throw new Error(`Failed to start mDNS discovery: ${error.message}`);
+    }
+  }
+
+  /**
+   * 处理已解析的服务（参考 moonlight-ohos 的 localServiceInfoToExternalAddr）
+   */
+  private async handleResolvedService(resolvedInfo: mdns.LocalServiceInfo): Promise<void> {
+    if (this.disposed) {
+      return;
+    }
+
+    if (!resolvedInfo.host) {
+      Logger.warn('MdnsDiscovery', 'MdnsDiscovery: 解析的服务没有 host 信息');
+      return;
+    }
+
+    const host = resolvedInfo.host;
+    const port = host.port ?? NvHttp.DEFAULT_HTTP_PORT;
+
+    Logger.info('MdnsDiscovery', `MdnsDiscovery: 发现服务器 ${resolvedInfo.serviceName} @ ${host.address} (family=${host.family})`);
+
+    // mDNS 返回的主地址
+    let primaryAddress = host.address;
+    // 如果 mDNS 直接返回了 IPv6 地址，记录下来
+    let ipv6Address: string | undefined = host.family === 2 ? host.address : undefined;
+
+    // IPv6 查找统一由 ComputerManager.lookupAndSetIpv6 负责
+    // 避免在此处重复查询：ComputerManager 有更完整的上下文（serverInfo 返回的真实 hostname）
+
+    const computer: DiscoveredComputer = {
+      name: resolvedInfo.serviceName,
+      address: primaryAddress,
+      port: port,
+      ipv6Address: ipv6Address
+    };
+
+    this.discoveredComputers.set(computer.name, computer);
+
+    if (this.onComputerFound) {
+      this.onComputerFound(computer);
+    }
+  }
+
+  /**
+   * 解析服务获取详细信息（旧方法，保留兼容）
+   */
+  private async resolveService(serviceInfo: mdns.LocalServiceInfo): Promise<void> {
+    try {
+      const resolvedService = await mdns.resolveLocalService(this.context, serviceInfo);
+
+      Logger.info('MdnsDiscovery', `MdnsDiscovery: 解析服务 ${resolvedService.serviceName}`);
+      Logger.info('MdnsDiscovery', `  - 主机地址: ${resolvedService.host?.address}`);
+      Logger.info('MdnsDiscovery', `  - 主机端口: ${resolvedService.host?.port}`);
+      Logger.info('MdnsDiscovery', `  - 服务端口: ${resolvedService.port}`);
+      Logger.info('MdnsDiscovery', `  - 完整信息: ${JSON.stringify(resolvedService)}`);
+
+      if (resolvedService.host?.address) {
+        // 优先使用 host.port（参考 moonlight-ohos 实现）
+        const port = resolvedService.host?.port || resolvedService.port || NvHttp.DEFAULT_HTTP_PORT;
+        
+        const computer: DiscoveredComputer = {
+          name: resolvedService.serviceName,
+          address: resolvedService.host.address,
+          port: port
+        };
+
+        // 检查是否是 IPv6 地址
+        if (resolvedService.host.address.includes(':')) {
+          computer.ipv6Address = resolvedService.host.address;
+          // IPv6 地址，尝试获取 IPv4
+          // HarmonyOS API 可能只返回一个地址，暂时使用 IPv6
+        }
+
+        Logger.info('MdnsDiscovery', `MdnsDiscovery: 发现电脑 ${computer.name} @ ${computer.address}:${computer.port}`);
+        this.discoveredComputers.set(computer.name, computer);
+
+        // 通知回调
+        if (this.onComputerFound) {
+          this.onComputerFound(computer);
+        }
+      }
+    } catch (err) {
+      const error = err as BusinessError;
+      Logger.error('MdnsDiscovery', `MdnsDiscovery: 解析服务失败 - ${error.code}: ${error.message}`);
+    }
+  }
+
+  /**
+   * 停止发现
+   */
+  stopDiscovery(): void {
+    if (!this.isDiscovering || !this.discoveryService) {
+      return;
+    }
+
+    Logger.info('MdnsDiscovery', 'MdnsDiscovery: 停止发现');
+    this.disposed = true;
+
+    try {
+      this.discoveryService.stopSearchingMDNS();
+      this.discoveryService.off('serviceFound');
+      this.discoveryService.off('serviceLost');
+      this.discoveryService.off('discoveryStart');
+      this.discoveryService.off('discoveryStop');
+    } catch (err) {
+      Logger.error('MdnsDiscovery', 'MdnsDiscovery: 停止发现失败', err);
+    }
+
+    this.discoveryService = null;
+    this.isDiscovering = false;
+  }
+
+  /**
+   * 发现一段时间后返回结果
+   */
+  async discover(timeout: number = MdnsDiscovery.DISCOVERY_TIMEOUT): Promise<DiscoveredComputer[]> {
+    await this.startDiscovery();
+
+    // 等待发现超时
+    await new Promise<void>((resolve: Function) => setTimeout(resolve, timeout));
+
+    this.stopDiscovery();
+
+    return Array.from(this.discoveredComputers.values());
+  }
+
+  /**
+   * 获取已发现的计算机列表
+   */
+  getDiscoveredComputers(): DiscoveredComputer[] {
+    return Array.from(this.discoveredComputers.values());
+  }
+
+  /**
+   * 是否正在发现
+   */
+  isSearching(): boolean {
+    return this.isDiscovering;
+  }
+}

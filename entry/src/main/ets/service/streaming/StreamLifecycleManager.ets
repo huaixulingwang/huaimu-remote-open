@@ -1,0 +1,506 @@
+/*
+ * Moonlight for HarmonyOS
+ * Copyright (C) 2024-2025 Moonlight/AlkaidLab
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ */
+
+/**
+ * 串流页面生命周期管理器
+ *
+ * 封装应用前后台状态、屏幕旋转、连接终止、延迟统计等生命周期逻辑，
+ * 从 StreamPage 中解耦以降低单文件复杂度。
+ */
+import { display, promptAction } from '@kit.ArkUI';
+import { StreamViewModel } from '../../viewmodel/StreamViewModel';
+import { StreamWindowManager } from './StreamWindowManager';
+import { AppStateService, AppState } from '../AppStateService';
+import { BackgroundStreamService, BroadcastControlCallbacks } from './BackgroundStreamService';
+import { common } from '@kit.AbilityKit';
+import { MoonBridge, ML_TEST_RESULT_INCONCLUSIVE, CONNECTION_TEST_SERVER } from './MoonBridge';
+import { ToastQueue } from '../../utils/ToastQueue';
+import { Logger } from '../../common/Logger';
+
+/**
+ * StreamPage 需要实现的回调接口
+ * 用于将 UI 相关操作（@State 更新、路由跳转）委托回 StreamPage
+ */
+export interface LifecycleCallbacks {
+  /** 更新 XComponent 尺寸（@State 变量） */
+  updateXComponentSize: (width: Length, height: Length) => void;
+  /** 更新缩放处理器父容器尺寸 */
+  updatePanZoomParentSize: (width: number, height: number) => void;
+  /** 停止串流并返回菜单页 */
+  stopStreaming: () => void;
+  /** 重连串流（无后台保活时从后台恢复） */
+  reconnectStreaming: () => void;
+  /** 释放所有按键状态（退后台/失焦时调用，防止修饰键卡住） */
+  releaseAllKeys: () => void;
+  /** 对账按键状态（回前台时调用，补发仍物理按住的键） */
+  reconcileKeyState: () => void;
+}
+
+export class StreamLifecycleManager {
+  // ── 外部依赖 ──
+  private viewModel: StreamViewModel | null = null;
+  private windowManager: StreamWindowManager | null = null;
+  private callbacks: LifecycleCallbacks | null = null;
+
+  // ── 应用状态相关 ──
+  private appStateService: AppStateService = AppStateService.getInstance();
+  private appStateListener: ((state: AppState) => void) | null = null;
+  private wasInBackground: boolean = false;
+  private backgroundService: BackgroundStreamService = BackgroundStreamService.getInstance();
+  private enableBackgroundTask: boolean = true;  // 后台保活开关
+  /** 后台期间收到的连接终止错误码（延迟到前台处理） */
+  private pendingTerminationErrorCode: number | null = null;
+
+  // ── 屏幕方向变化监听相关 ──
+  private displayChangeCallback: ((displayId: number) => void) | null = null;
+  private lastDisplayOrientation: boolean | null = null; // null=未初始化, true=横屏, false=竖屏
+
+  // ── 延迟统计 ──
+  private latencyToastEnabled: boolean = false;
+  /** 禁用串流期间的连接警告消息 */
+  private disableWarnings: boolean = false;
+
+  /**
+   * 初始化依赖项
+   */
+  initialize(viewModel: StreamViewModel, windowManager: StreamWindowManager | null,
+    callbacks: LifecycleCallbacks): void {
+    this.viewModel = viewModel;
+    this.windowManager = windowManager;
+    this.callbacks = callbacks;
+  }
+
+  /**
+   * 设置是否启用延迟统计 Toast
+   */
+  setLatencyToastEnabled(enabled: boolean): void {
+    this.latencyToastEnabled = enabled;
+  }
+
+  /**
+   * 设置是否禁用串流期间的连接警告消息
+   */
+  setDisableWarnings(disabled: boolean): void {
+    this.disableWarnings = disabled;
+  }
+
+  /**
+   * 设置是否启用后台保活
+   * 关闭后台保活时，从后台恢复会走重连路径而非 Flush+IDR
+   */
+  setEnableBackgroundTask(enabled: boolean): void {
+    this.enableBackgroundTask = enabled;
+  }
+
+  // ==================== 应用前后台状态 ====================
+
+  /**
+   * 注册应用前后台状态监听
+   */
+  registerAppStateListener(): void {
+    this.appStateListener = (state: AppState) => {
+      if (state === AppState.BACKGROUND) {
+        Logger.info('StreamLifecycleManager', '[StreamPage] 应用进入后台');
+        this.wasInBackground = true;
+        // 退后台时 KEY_UP 不会再送达应用，立即释放所有按键状态，
+        // 防止 Windows 端 Alt/Ctrl 卡住（切回后无法打字、鼠标操作异常）
+        this.callbacks?.releaseAllKeys();
+      } else if (state === AppState.FOREGROUND && this.wasInBackground) {
+        Logger.info('StreamLifecycleManager', '[StreamPage] 应用从后台恢复');
+        this.wasInBackground = false;
+        // 回前台对账按键状态；与窗口焦点恢复回调先后到达时均可安全重复调用
+        // （未连接时 reconcileKeyState 不消费记录，留给重连后的焦点恢复）
+        this.callbacks?.reconcileKeyState();
+        this.handleAppResume();
+      }
+    };
+    this.appStateService.addListener(this.appStateListener);
+  }
+
+  /**
+   * 取消应用状态监听
+   */
+  unregisterAppStateListener(): void {
+    if (this.appStateListener) {
+      this.appStateService.removeListener(this.appStateListener);
+      this.appStateListener = null;
+    }
+  }
+
+  // ==================== 屏幕旋转 ====================
+
+  /**
+   * 注册屏幕方向变化监听
+   * 使用 display.on('change') 监听屏幕变化
+   */
+  registerDisplayChangeListener(): void {
+    try {
+      this.displayChangeCallback = (displayId: number): void => {
+        this.handleDisplayChange(displayId);
+      };
+      display.on('change', this.displayChangeCallback);
+      Logger.info('StreamLifecycleManager', '[StreamPage] 已注册屏幕方向变化监听');
+    } catch (err) {
+      Logger.warn('StreamLifecycleManager', '[StreamPage] 注册屏幕方向监听失败:', err);
+    }
+  }
+
+  /**
+   * 取消屏幕方向变化监听
+   */
+  unregisterDisplayChangeListener(): void {
+    if (this.displayChangeCallback) {
+      try {
+        display.off('change', this.displayChangeCallback);
+        Logger.info('StreamLifecycleManager', '[StreamPage] 已取消屏幕方向变化监听');
+      } catch (err) {
+        Logger.warn('StreamLifecycleManager', '[StreamPage] 取消屏幕方向监听失败:', err);
+      }
+      this.displayChangeCallback = null;
+    }
+  }
+
+  /**
+   * 处理屏幕变化事件
+   * @param displayId 发生变化的显示器 ID
+   */
+  private handleDisplayChange(displayId: number): void {
+    // 只处理连接状态
+    if (!this.viewModel?.isConnected) {
+      return;
+    }
+
+    try {
+      const displayInfo = display.getDefaultDisplaySync();
+      const isLandscape = displayInfo.width > displayInfo.height;
+
+      // 只有方向真正变化时才处理
+      if (this.lastDisplayOrientation !== null && this.lastDisplayOrientation === isLandscape) {
+        return;
+      }
+
+      Logger.info('StreamLifecycleManager', `[StreamPage] 屏幕方向变化: ${isLandscape ? '横屏' : '竖屏'}, displayId=${displayId}`);
+      this.lastDisplayOrientation = isLandscape;
+
+      // 通知 ViewModel 处理旋转
+      this.viewModel?.handleRotationChange(isLandscape);
+
+      // 更新屏幕尺寸
+      this.updateScreenSizeAfterRotation();
+    } catch (err) {
+      Logger.warn('StreamLifecycleManager', '[StreamPage] 处理屏幕变化失败:', err);
+    }
+  }
+
+  /**
+   * 屏幕旋转后更新尺寸
+   */
+  async updateScreenSizeAfterRotation(): Promise<void> {
+    try {
+      if (!this.windowManager) return;
+
+      let viewportSize = await this.windowManager.updateScreenSize();
+      if (!this.windowManager.isFullscreen) {
+        viewportSize = await this.windowManager.getCurrentWindowViewportSize();
+      }
+
+      if (this.viewModel) {
+        this.viewModel.displayInfo.screenWidth = viewportSize.width;
+        this.viewModel.displayInfo.screenHeight = viewportSize.height;
+      }
+
+      // 重新计算 XComponent 尺寸
+      const xComponentSize = this.windowManager.isFullscreen
+        ? this.windowManager.calculateXComponentSize(
+          this.viewModel?.displayInfo.stretchVideo ?? false
+        )
+        : this.windowManager.calculateXComponentSizeForViewport(
+          viewportSize.width,
+          viewportSize.height,
+          this.viewModel?.displayInfo.stretchVideo ?? false
+        );
+      if (xComponentSize) {
+        this.callbacks?.updateXComponentSize(xComponentSize.width, xComponentSize.height);
+        this.callbacks?.updatePanZoomParentSize(viewportSize.width, viewportSize.height);
+      }
+    } catch (err) {
+      Logger.warn('StreamLifecycleManager', '[StreamPage] 更新屏幕尺寸失败:', err);
+    }
+  }
+
+  /**
+   * 处理服务端分辨率变化（屏幕旋转/分辨率改变）
+   * 更新窗口管理器的串流分辨率并重新计算 XComponent 尺寸
+   */
+  async handleServerResolutionChanged(width: number, height: number): Promise<void> {
+    Logger.info('StreamLifecycleManager', `[StreamPage] 服务端分辨率变化: ${width}x${height}`);
+    if (!this.windowManager) return;
+
+    // 更新窗口管理器的串流分辨率
+    this.windowManager.setStreamResolution(width, height);
+
+    // 重新配置窗口方向（可能会触发屏幕旋转）
+    await this.windowManager.configureOrientation();
+
+    // 更新视口尺寸（浮窗模式下使用实际窗口内容区）
+    let viewportSize = await this.windowManager.updateScreenSize();
+    if (!this.windowManager.isFullscreen) {
+      viewportSize = await this.windowManager.getCurrentWindowViewportSize();
+    }
+    if (this.viewModel) {
+      this.viewModel.displayInfo.screenWidth = viewportSize.width;
+      this.viewModel.displayInfo.screenHeight = viewportSize.height;
+    }
+
+    // 重新计算 XComponent 尺寸以避免画面拉伸/裁剪
+    const xComponentSize = this.windowManager.isFullscreen
+      ? this.windowManager.calculateXComponentSize(
+        this.viewModel?.displayInfo.stretchVideo ?? false
+      )
+      : this.windowManager.calculateXComponentSizeForViewport(
+        viewportSize.width,
+        viewportSize.height,
+        this.viewModel?.displayInfo.stretchVideo ?? false
+      );
+    if (xComponentSize) {
+      this.callbacks?.updateXComponentSize(xComponentSize.width, xComponentSize.height);
+      this.callbacks?.updatePanZoomParentSize(viewportSize.width, viewportSize.height);
+      Logger.info('StreamLifecycleManager', `[StreamPage] XComponent 尺寸更新: ${JSON.stringify(xComponentSize)}`);
+    }
+  }
+
+  // ==================== 后台保活 (AVSession + 长时任务) ====================
+
+  /**
+   * 启动后台保活服务
+   * 在串流连接建立后调用，防止应用退到后台时被系统冻结
+   * @param context UIAbilityContext
+   * @param gameName 当前串流的游戏名称
+   */
+  async startBackgroundTask(context: common.UIAbilityContext, gameName?: string): Promise<void> {
+    try {
+      // 播控中心"停止"按钮 → 断开串流
+      const broadcastCallbacks: BroadcastControlCallbacks = {
+        onStop: () => {
+          Logger.info('StreamLifecycleManager', '[StreamPage] 播控中心请求停止串流');
+          if (this.callbacks) {
+            this.callbacks.stopStreaming();
+          }
+        }
+      } as BroadcastControlCallbacks;
+      await this.backgroundService.start(context, gameName, broadcastCallbacks);
+      Logger.info('StreamLifecycleManager', '[StreamPage] 后台保活已启动');
+    } catch (err) {
+      Logger.warn('StreamLifecycleManager', '[StreamPage] 启动后台保活失败（不影响串流）:', err);
+    }
+  }
+
+  /**
+   * 停止后台保活服务
+   * 在串流结束时调用
+   */
+  async stopBackgroundTask(): Promise<void> {
+    try {
+      await this.backgroundService.stop();
+      Logger.info('StreamLifecycleManager', '[StreamPage] 后台保活已停止');
+    } catch (err) {
+      Logger.warn('StreamLifecycleManager', '[StreamPage] 停止后台保活失败:', err);
+    }
+  }
+
+  // ==================== 应用恢复 ====================
+
+  /**
+   * 处理应用从后台恢复
+   * 当应用从后台切回前台时，需要检查串流状态并尝试恢复
+   * - 后台保活开启：进程未被冻结，Flush+IDR 恢复解码器
+   * - 后台保活关闭：进程可能被系统冻结，连接可能已断，执行重连
+   * - 如果后台期间连接已断开（pendingTerminationErrorCode），尝试重连
+   */
+  private handleAppResume(): void {
+    Logger.info('StreamLifecycleManager', `[StreamPage] 处理应用恢复, 连接状态: ${this.viewModel?.connectionState}, ` +
+      `后台保活: ${this.enableBackgroundTask}, 待处理断连: ${this.pendingTerminationErrorCode}`);
+
+    // 后台期间连接断开 → 尝试重连而非直接弹错误对话框
+    if (this.pendingTerminationErrorCode !== null) {
+      const errorCode = this.pendingTerminationErrorCode;
+      this.pendingTerminationErrorCode = null;
+      Logger.info('StreamLifecycleManager', `[StreamPage] 后台期间连接断开 (errorCode=${errorCode})，尝试重连...`);
+      this.callbacks?.reconnectStreaming();
+      return;
+    }
+
+    if (this.enableBackgroundTask) {
+      // 后台保活开启：进程一直在运行，只需恢复解码器
+      if (this.viewModel?.isConnected) {
+        Logger.info('StreamLifecycleManager', '[StreamPage] 后台保活开启，尝试恢复串流...');
+        this.viewModel.resumeFromBackground();
+      }
+    } else {
+      // 后台保活关闭：进程可能被冻结过，执行重连
+      Logger.info('StreamLifecycleManager', '[StreamPage] 后台保活关闭，触发重连...');
+      this.callbacks?.reconnectStreaming();
+    }
+  }
+
+  // ==================== 延迟统计 ====================
+
+  /**
+   * 串流结束后显示延迟统计 Toast
+   * 对齐 Android: Game.connectionTerminated() 中 enableLatencyToast 逻辑
+   */
+  showLatencyToastIfEnabled(): void {
+    Logger.info('StreamLifecycleManager', `[StreamPage] showLatencyToast: enabled=${this.latencyToastEnabled}`);
+    if (!this.latencyToastEnabled) {
+      return;
+    }
+
+    // 使用 getSummaryStats 获取有效数据（断连后 native 数据可能已清零）
+    const session = this.viewModel?.getSession();
+    const stats = session ? session.getSummaryStats() : this.viewModel?.performanceStats;
+    if (!stats) return;
+
+    Logger.info('StreamLifecycleManager', `[StreamPage] stats: net=${stats.networkLatency}, decode=${stats.latency}, host=${stats.hostLatency}, fps=${stats.renderedFps}`);
+    const parts: string[] = [];
+
+    // 网络延迟 (RTT)
+    if (stats.networkLatency > 0) {
+      parts.push(`网络: ${stats.networkLatency}ms`);
+    }
+    // 解码延迟 - 使用全局累计平均值（真实平均，非 EMA）
+    const decodeLatency = stats.globalAvgDecodeLatency > 0 ? stats.globalAvgDecodeLatency : stats.latency;
+    if (decodeLatency > 0) {
+      parts.push(`解码: ${decodeLatency.toFixed(1)}ms`);
+    }
+    // 主机延迟 - 使用全局累计平均值
+    const hostLatency = stats.globalAvgHostLatency > 0 ? stats.globalAvgHostLatency : stats.hostLatency;
+    if (hostLatency > 0) {
+      parts.push(`主机: ${hostLatency.toFixed(1)}ms`);
+    }
+    // 帧率 - 使用全局平均帧率（真实平均，非瞬时窗口值）
+    const avgFps = stats.globalAvgFps > 0 ? Math.round(stats.globalAvgFps) : stats.renderedFps;
+    if (avgFps > 0) {
+      parts.push(`帧率: ${avgFps}fps`);
+    }
+    // 丢帧统计 - 仅在有丢帧时显示各级别明细
+    if (stats.droppedFrames > 0) {
+      const dropDetails: string[] = [];
+      if (stats.droppedByL1 > 0) dropDetails.push(`L1:${stats.droppedByL1}`);
+      if (stats.droppedByL2 > 0) dropDetails.push(`L2:${stats.droppedByL2}`);
+      if (stats.droppedByL3 > 0) dropDetails.push(`L3:${stats.droppedByL3}`);
+      if (stats.droppedByL4 > 0) dropDetails.push(`L4:${stats.droppedByL4}`);
+      if (stats.droppedByL5 > 0) dropDetails.push(`L5:${stats.droppedByL5}`);
+      const detail = dropDetails.length > 0 ? ` (${dropDetails.join(' ')})` : '';
+      parts.push(`丢帧: ${stats.droppedFrames}${detail}`);
+    }
+
+    const message = parts.length > 0 ? parts.join(' | ') : '串流已结束';
+    ToastQueue.show({
+      message: message,
+      duration: 3500
+    });
+  }
+
+  // ==================== 连接终止 ====================
+
+  /**
+   * 处理服务器断开连接
+   * errorCode: 0 = 正常关闭（如用户在服务器端退出游戏）
+   *           -100 = 无视频流量（端口问题）
+   *           -101 = 无完整帧（网络不稳定）
+   *           -102 = 意外提前终止
+   *           -103 = 受保护内容
+   *           -104 = 帧转换错误
+   */
+  handleConnectionTerminated(errorCode: number): void {
+    Logger.info('StreamLifecycleManager', `StreamPage: 连接终止, errorCode=${errorCode}, inBackground=${this.wasInBackground}`);
+
+    const ML_ERROR_GRACEFUL_TERMINATION = 0;
+    const ML_ERROR_NO_VIDEO_TRAFFIC = -100;
+    const ML_ERROR_NO_VIDEO_FRAME = -101;
+    const ML_ERROR_UNEXPECTED_EARLY_TERMINATION = -102;
+    const ML_ERROR_PROTECTED_CONTENT = -103;
+    const ML_ERROR_FRAME_CONVERSION = -104;
+
+    // 应用在后台时连接断开：延迟处理，等回到前台时尝试重连
+    if (this.wasInBackground) {
+      Logger.info('StreamLifecycleManager', `[StreamPage] 后台期间连接断开，延迟处理 (errorCode=${errorCode})`);
+      this.pendingTerminationErrorCode = errorCode;
+      return;
+    }
+
+    if (errorCode === ML_ERROR_GRACEFUL_TERMINATION) {
+      // 服务器正常关闭（用户在服务器端退出游戏），stopStreaming 内部会显示延迟统计
+      this.callbacks?.stopStreaming();
+    } else if (this.disableWarnings) {
+      // 禁用警告：不弹出错误对话框，直接停止串流
+      this.callbacks?.stopStreaming();
+    } else {
+      // 连接异常终止，进行端口诊断并显示错误信息
+      const portFlags = MoonBridge.getPortFlagsFromTerminationErrorCode(errorCode);
+      let portTestResult = ML_TEST_RESULT_INCONCLUSIVE;
+      if (portFlags !== 0) {
+        try {
+          portTestResult = MoonBridge.testClientConnectivity(CONNECTION_TEST_SERVER, 443, portFlags);
+        } catch (e) {
+          Logger.warn('StreamLifecycleManager', `端口诊断失败: ${e}`);
+        }
+      }
+
+      let message: string;
+      if (portTestResult !== ML_TEST_RESULT_INCONCLUSIVE && portTestResult !== 0) {
+        // 端口被封锁
+        message = '检测到端口被封锁，请检查防火墙或端口转发规则。';
+      } else {
+        switch (errorCode) {
+          case ML_ERROR_NO_VIDEO_TRAFFIC:
+            message = '未收到视频数据。请检查防火墙或端口转发规则（UDP 47998）。';
+            break;
+          case ML_ERROR_NO_VIDEO_FRAME:
+            message = '未收到完整视频帧。网络可能不稳定或码率设置过高。';
+            break;
+          case ML_ERROR_UNEXPECTED_EARLY_TERMINATION:
+          case ML_ERROR_PROTECTED_CONTENT:
+            message = '串流意外终止。可能是受保护内容或编码器无法捕获视频。';
+            break;
+          case ML_ERROR_FRAME_CONVERSION:
+            message = '帧转换错误。请尝试调整分辨率或关闭 HDR。';
+            break;
+          default:
+            const errorHex = Math.abs(errorCode) > 1000 ? `0x${errorCode.toString(16)}` : errorCode.toString();
+            message = `连接已断开 (错误码: ${errorHex})`;
+            break;
+        }
+      }
+
+      // 附加被封锁的端口信息
+      if (portFlags !== 0) {
+        try {
+          const portInfo = MoonBridge.stringifyPortFlags(portFlags, '\n');
+          if (portInfo) {
+            message += `\n\n请确保以下端口已开放:\n${portInfo}`;
+          }
+        } catch (e) {
+          Logger.warn('StreamLifecycleManager', `端口信息格式化失败: ${e}`);
+        }
+      }
+
+      promptAction.showDialog({
+        title: '连接已断开',
+        message: message,
+        buttons: [{ text: '确定', color: '#3B82F6' }]
+      }).then(() => {
+        this.callbacks?.stopStreaming();
+      }).catch(() => {
+        this.callbacks?.stopStreaming();
+      });
+    }
+  }
+}

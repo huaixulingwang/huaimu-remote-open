@@ -1,0 +1,995 @@
+/*
+ * Moonlight for HarmonyOS
+ * Copyright (C) 2024-2025 Moonlight/AlkaidLab
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ */
+
+/**
+ * 设置服务
+ * 
+ * 统一管理应用设置的读取和转换
+ * 将设置值转换为串流配置
+ */
+import { PreferencesUtil } from '../utils/PreferencesUtil';
+import { display } from '@kit.ArkUI';
+import {
+  StreamConfig,
+  AudioConfiguration,
+  ColorRange,
+  HdrMode,
+  RemoteConfig,
+  ScreenCombinationMode,
+  PerfOverlayOrientation,
+  PerfOverlayPosition,
+  getRecommendedBitrate,
+  GAME_VIBRATION_STRENGTH_DEFAULT,
+  normalizeGameVibrationStrength
+} from '../model/StreamConfig';
+
+/**
+ * 设置键名常量类（与 SettingsPageV2 保持同步）
+ */
+export class SettingsKeys {
+  // 视频设置
+  static readonly RESOLUTION: string = 'settings_resolution';
+  static readonly CUSTOM_RESOLUTIONS: string = 'settings_custom_resolutions';
+  static readonly FPS: string = 'settings_fps';
+  static readonly CUSTOM_FPS: string = 'settings_custom_fps';
+  static readonly BITRATE: string = 'settings_bitrate';
+  static readonly BANDWIDTH_PROBE_ENABLED: string = 'settings_bandwidth_probe_enabled';
+  static readonly METERED_BANDWIDTH_PROBE_ENABLED: string = 'settings_metered_bandwidth_probe_enabled';
+  static readonly HOST_SCALE: string = 'settings_host_scale';
+  static readonly ENABLE_HDR: string = 'settings_enable_hdr';
+  static readonly HDR_MODE: string = 'settings_hdr_mode';  // 'HDR10' or 'HLG'
+  static readonly ENABLE_HDR_HIGH_BRIGHTNESS: string = 'settings_enable_hdr_high_brightness';
+  static readonly HDR_BRIGHTNESS_OVERRIDE: string = 'settings_hdr_brightness_override';
+  static readonly HDR_PEAK_BRIGHTNESS_NITS: string = 'settings_hdr_peak_brightness_nits';
+  static readonly VIDEO_FORMAT: string = 'settings_video_format';
+  static readonly STRETCH_VIDEO: string = 'settings_stretch_video';
+  static readonly FULL_RANGE: string = 'settings_full_range';
+  static readonly REVERSE_RESOLUTION: string = 'settings_reverse_resolution';
+  static readonly ROTABLE_SCREEN: string = 'settings_rotable_screen';
+  static readonly SCREEN_POSITION: string = 'settings_screen_position';
+  static readonly SCREEN_OFFSET_X: string = 'settings_screen_offset_x';
+  static readonly SCREEN_OFFSET_Y: string = 'settings_screen_offset_y';
+
+  // 音频设置
+  static readonly AUDIO_CONFIG: string = 'settings_audio_config';
+  static readonly ENABLE_LOCAL_AUDIO: string = 'settings_enable_local_audio';
+  static readonly ENABLE_SPATIALIZER: string = 'settings_enable_spatializer';
+  static readonly CONTROL_ONLY: string = 'settings_control_only';
+  static readonly ENABLE_MIC: string = 'settings_enable_mic';
+  static readonly MIC_BITRATE: string = 'settings_mic_bitrate';
+  static readonly AUDIO_COMPAT_MODE: string = 'settings_audio_compat_mode';
+
+  // 剪贴板同步设置
+  static readonly ENABLE_CLIPBOARD_SYNC_TEXT: string = 'settings_enable_clipboard_sync_text';
+  static readonly ENABLE_CLIPBOARD_SYNC_IMAGE: string = 'settings_enable_clipboard_sync_image';
+
+  // 输入 - 手柄设置
+  static readonly ENABLE_VIBRATION: string = 'settings_enable_vibration';
+  static readonly VIBRATION_MODE: string = 'settings_vibration_mode';  // 震动模式：自动/仅手柄/仅设备/协同
+  static readonly VIBRATE_FALLBACK_STRENGTH: string = 'settings_vibrate_fallback_strength';  // 历史存储键，现用于游戏震动强度
+  static readonly ENABLE_AUDIO_VIBRATION: string = 'settings_enable_audio_vibration';  // 音频振动（低频驱动）
+  static readonly AUDIO_VIBRATION_STRENGTH: string = 'settings_audio_vibration_strength';  // 音频振动强度 (0-100)
+  static readonly AUDIO_VIBRATION_SCENE_MODE: string = 'settings_audio_vibration_scene_mode';  // 音频振动场景模式
+  static readonly MULTI_CONTROLLER: string = 'settings_multi_controller';
+  static readonly FLIP_FACE_BUTTONS: string = 'settings_flip_face_buttons';
+  static readonly DEADZONE: string = 'settings_deadzone';
+  static readonly GAMEPAD_MOTION_SENSORS: string = 'settings_gamepad_motion_sensors';
+  static readonly GAMEPAD_MOTION_FALLBACK: string = 'settings_gamepad_motion_fallback';
+  static readonly GAMEPAD_TOUCHPAD_MOUSE: string = 'settings_gamepad_touchpad_mouse';
+
+  // 输入 - 体感助手（陀螺仪映射右摇杆）
+  static readonly GYRO_ASSIST_ENABLED: string = 'settings_gyro_assist_enabled';
+  static readonly GYRO_SENSITIVITY: string = 'settings_gyro_sensitivity';
+  static readonly GYRO_INVERT_X: string = 'settings_gyro_invert_x';
+  static readonly GYRO_INVERT_Y: string = 'settings_gyro_invert_y';
+  static readonly GYRO_ACTIVATION_KEY: string = 'settings_gyro_activation_key';
+  static readonly SHOW_GYRO_CARD: string = 'settings_show_gyro_card';
+
+  static readonly ENABLE_START_KEY_MENU: string = 'settings_enable_start_key_menu';
+  static readonly IGNORE_DEVICE_DISCONNECT: string = 'settings_ignore_device_disconnect';  // 忽略手柄断开信号（用于电源管理问题的手柄）
+  static readonly GC_BUTTON_HOME_MAPPING: string = 'settings_gc_button_home_mapping';  // Game Controller Kit 2313按键映射
+  static readonly ENABLE_KEY_INTERCEPTOR: string = 'settings_enable_key_interceptor';  // 按键反劫持（拦截系统劫持的手柄按键）
+  static readonly USB_DRIVER_ENABLED: string = 'settings_usb_driver_enabled';  // 默认启用 USB 手柄驱动
+  static readonly FORCE_USB_DRIVER_ONLY: string = 'settings_force_usb_driver_only';  // 强制纯 USB 驱动模式（禁用 GCK）
+  static readonly DDK_HIGH_SPEED_POLLING: string = 'settings_ddk_high_speed_polling';  // USB 驱动高速轮询（DDK）
+  static readonly USB_FORWARDING_ENABLED: string = 'settings_usb_forwarding_enabled';  // USB/IP 反向隧道转发（OTG 手柄直通主机）
+
+  // 输入 - 屏幕控制器
+  static readonly ENABLE_ONSCREEN_CONTROLS: string = 'settings_enable_onscreen_controls';
+  static readonly ENABLE_ONSCREEN_KEYBOARD: string = 'settings_enable_onscreen_keyboard';
+  static readonly ONLY_L3_R3: string = 'settings_only_l3_r3';
+  static readonly SHOW_GUIDE_BUTTON: string = 'settings_show_guide_button';
+  static readonly HALF_HEIGHT_OSC_PORTRAIT: string = 'settings_half_height_osc_portrait';
+  static readonly OSC_OPACITY: string = 'settings_osc_opacity';
+  static readonly VIBRATE_OSC: string = 'settings_vibrate_osc';
+
+  // 输入 - 鼠标/触控
+  static readonly SHOW_LOCAL_CURSOR: string = 'settings_show_local_cursor';
+  static readonly TOUCHSCREEN_TRACKPAD: string = 'settings_touchscreen_trackpad';
+  static readonly ENABLE_THREE_FINGER_IME: string = 'settings_enable_three_finger_ime';
+  static readonly LOW_LATENCY_TOUCH: string = 'settings_low_latency_touch';
+  static readonly ENABLE_DOUBLE_CLICK_DRAG: string = 'settings_enable_double_click_drag';
+  static readonly DOUBLE_TAP_TIME_THRESHOLD: string = 'settings_double_tap_time_threshold';
+  static readonly MOUSE_NAV_BUTTONS: string = 'settings_mouse_nav_buttons';
+  static readonly GAME_MOUSE_MODE: string = 'settings_game_mouse_mode';  // 游戏鼠标模式（相对模式）
+  static readonly LAST_TOUCH_MODE: string = 'settings_last_touch_mode';  // 运行时触摸模式（菜单切换后持久化）
+
+  // 增强触控设置
+  static readonly ENABLE_ENHANCED_TOUCH: string = 'settings_enable_enhanced_touch';
+  static readonly ENHANCED_TOUCH_ON_RIGHT: string = 'settings_enhanced_touch_on_right';
+  static readonly ENHANCED_TOUCH_ZONE_DIVIDER: string = 'settings_enhanced_touch_zone_divider';
+  static readonly POINTER_VELOCITY_FACTOR: string = 'settings_pointer_velocity_factor';
+  static readonly LONG_PRESS_FLAT_REGION: string = 'settings_long_press_flat_region';
+
+  // 主机设置
+  static readonly ENABLE_SOPS: string = 'settings_enable_sops';
+  static readonly SCREEN_COMBINATION_MODE: string = 'settings_screen_combination_mode';
+  static readonly LOCK_SCREEN_AFTER_DISCONNECT: string = 'settings_lock_screen_after_disconnect';
+  // 隐私屏：开启后串流强制走虚拟显示器 + 仅此屏（物理屏全黑），断开后由主机端值班脚本自动恢复
+  static readonly PRIVACY_SCREEN_ENABLED: string = 'settings_privacy_screen_enabled';
+
+  // 高级设置
+  static readonly DECODER_BUFFER_COUNT: string = 'settings_decoder_buffer_count';
+  static readonly ENABLE_SYNC_DECODE: string = 'settings_enable_sync_decode';  // 同步解码模式
+  static readonly ENABLE_VRR: string = 'settings_enable_vrr';  // VRR 可变刷新率模式
+  static readonly ENABLE_VSYNC: string = 'settings_enable_vsync';
+  // Keep the PR #58 key value so existing experimental settings migrate without data loss.
+  static readonly ENABLE_HOST_PACED_PRESENTATION: string = 'settings_enable_two_step_precise_sync';
+  static readonly ADAPTIVE_BITRATE: string = 'settings_adaptive_bitrate';  // 智能码率调节
+  static readonly ABR_MODE: string = 'settings_abr_mode';  // ABR 模式: balanced | quality | lowLatency
+  static readonly ENABLE_POST_PROCESS: string = 'settings_enable_post_process';  // 后处理滤镜
+  static readonly UPSCALE_MODE: string = 'settings_upscale_mode';               // 超分辨率模式
+  static readonly UPSCALE_SHARPNESS: string = 'settings_upscale_sharpness';     // 超分锐度 (0-100)
+  static readonly SDR_TO_HDR: string = 'settings_sdr_to_hdr';                   // SDR→HDR（旧布尔值，向后兼容）
+  static readonly SDR_TO_HDR_MODE: string = 'settings_sdr_to_hdr_mode';         // HDR 增强模式 (0=关闭,1=自研shader,2=AIHDR)
+  static readonly SDR_TO_HDR_PEAK_NITS: string = 'settings_sdr_to_hdr_peak_nits'; // 峰值亮度
+  static readonly SDR_TO_HDR_SATURATION: string = 'settings_sdr_to_hdr_saturation'; // 饱和度
+  static readonly SDR_TO_HDR_CONTRAST: string = 'settings_sdr_to_hdr_contrast'; // 对比度
+  static readonly ENABLE_PERF_OVERLAY: string = 'settings_enable_perf_overlay';
+  static readonly PERF_OVERLAY_ORIENTATION: string = 'settings_perf_overlay_orientation';
+  static readonly PERF_OVERLAY_POSITION: string = 'settings_perf_overlay_position';
+  static readonly PERF_OVERLAY_LOCKED: string = 'settings_perf_overlay_locked';
+  static readonly PERF_OVERLAY_ITEMS: string = 'settings_perf_overlay_items';
+  static readonly PERF_OVERLAY_BG_OPACITY: string = 'settings_perf_overlay_bg_opacity';
+  static readonly PERF_OVERLAY_GUIDE_SHOWN: string = 'settings_perf_overlay_guide_shown';
+  static readonly LATENCY_TOAST: string = 'settings_latency_toast';
+  static readonly LAST_STREAM_DIAGNOSTICS: string = 'last_stream_diagnostics';
+  static readonly DISABLE_WARNINGS: string = 'settings_disable_warnings';
+  static readonly ENABLE_STUN: string = 'settings_enable_stun';
+  static readonly ENABLE_ESC_MENU: string = 'settings_enable_esc_menu';
+  static readonly ESC_MENU_KEY: string = 'settings_esc_menu_key';
+  static readonly ENABLE_BACKGROUND_TASK: string = 'settings_enable_background_task';  // 后台保活
+
+  // UI 设置
+  static readonly SMALL_ICON_MODE: string = 'settings_small_icon_mode';
+  static readonly BACKGROUND_IMAGE_URL: string = 'settings_background_image_url';
+  static readonly BACKGROUND_IMAGE_TYPE: string = 'settings_background_image_type';
+  static readonly RESUME_STREAM: string = 'settings_resume_stream';
+  
+  // 开发者模式
+  static readonly DEVELOPER_MODE: string = 'settings_developer_mode';
+  // 开发者模式已激活（一次激活永久有效）
+  static readonly DEV_KEY_ACTIVATED: string = 'settings_dev_key_activated';
+  static readonly DEV_GITHUB_LOGIN: string = 'settings_dev_github_login';
+  static readonly DEV_GITHUB_VERIFIED_AT: string = 'settings_dev_github_verified_at';
+  static readonly DEV_GITHUB_PENDING_DEVICE_CODE: string = 'settings_dev_github_pending_device_code';
+  static readonly DEV_GITHUB_PENDING_USER_CODE: string = 'settings_dev_github_pending_user_code';
+  static readonly DEV_GITHUB_PENDING_VERIFICATION_URI: string = 'settings_dev_github_pending_verification_uri';
+  static readonly DEV_GITHUB_PENDING_VERIFICATION_URI_COMPLETE: string = 'settings_dev_github_pending_verification_uri_complete';
+  static readonly DEV_GITHUB_PENDING_EXPIRES_AT: string = 'settings_dev_github_pending_expires_at';
+  static readonly DEV_GITHUB_PENDING_INTERVAL: string = 'settings_dev_github_pending_interval';
+  
+  // 性能模式
+  static readonly PERFORMANCE_MODE: string = 'settings_performance_mode';
+}
+
+/**
+ * 输入设置
+ */
+export interface InputSettings {
+  // 手柄
+  enableVibration: boolean;
+  vibrationMode: string;  // 自动/仅手柄/仅设备/协同
+  gameVibrationStrength: number;
+  enableAudioVibration: boolean;  // 音频振动（低频驱动）
+  audioVibrationStrength: number;  // 音频振动强度 (0-100)
+  audioVibrationSceneMode: string;  // 音频振动场景模式
+  multiController: boolean;
+  flipFaceButtons: boolean;
+  deadzone: number;
+  gamepadMotionSensors: boolean;
+  gamepadMotionFallback: boolean;
+  gamepadTouchpadMouse: boolean;
+  enableStartKeyMenu: boolean;
+  enableKeyInterceptor: boolean;  // 按键反劫持
+  usbDriverEnabled: boolean;  // 默认启用 USB 手柄驱动
+  forceUsbDriverOnly: boolean;  // 强制纯 USB 驱动模式
+  ddkHighSpeedPolling: boolean;  // USB 驱动高速轮询（DDK）
+  usbForwardingEnabled: boolean;  // USB/IP 反向隧道转发（OTG 手柄直通主机）
+
+  // 体感助手
+  gyroAssistEnabled: boolean;
+  gyroSensitivity: number;
+  gyroInvertX: boolean;
+  gyroInvertY: boolean;
+  gyroActivationKey: number;
+  showGyroCard: boolean;
+
+  // 屏幕控制器
+  enableOnscreenControls: boolean;
+  enableOnscreenKeyboard: boolean;
+  onlyL3R3: boolean;
+  showGuideButton: boolean;
+  halfHeightOscPortrait: boolean;
+  oscOpacity: number;
+  vibrateOsc: boolean;
+
+  // 鼠标/触控
+  showLocalCursor: boolean;
+  touchscreenTrackpad: boolean;
+  enableThreeFingerIme: boolean;
+  lowLatencyTouch: boolean;
+  enableDoubleClickDrag: boolean;
+  doubleTapTimeThreshold: number;
+  mouseNavButtons: boolean;
+  gameMouseMode: boolean;  // 游戏鼠标模式：相对增量+光标回弹，适合 FPS/TPS
+
+  // 增强触控
+  enableEnhancedTouch: boolean;
+  enhancedTouchOnRight: boolean;
+  enhancedTouchZoneDivider: number;
+  pointerVelocityFactor: number;
+  longPressFlatRegion: number;
+}
+
+/**
+ * 主机设置
+ */
+export interface HostSettings {
+  enableSops: boolean;
+  screenCombinationMode: string;
+  lockScreenAfterDisconnect: boolean;
+}
+
+export interface BandwidthProbeSettings {
+  probeEnabled: boolean;
+  meteredProbeEnabled: boolean;
+}
+
+/**
+ * 显示设置
+ */
+export interface DisplaySettings {
+  stretchVideo: boolean;
+  reverseResolution: boolean;
+  rotableScreen: boolean;
+  enableHdrHighBrightness: boolean;
+  hdrBrightnessOverride: boolean;
+  hdrPeakBrightnessNits: number;
+  screenPosition: string;            // 画面位置：9 宫格（居中/左上/上/右上/左/右/左下/下/右下）
+  screenOffsetX: number;             // 水平偏移百分比 (-100 ~ 100)
+  screenOffsetY: number;             // 垂直偏移百分比 (-100 ~ 100)
+  enablePerfOverlay: boolean;
+  perfOverlayOrientation: string;
+  perfOverlayPosition: string;
+  perfOverlayLocked?: boolean;       // 是否锁定覆盖层
+  perfOverlayItems?: string[];       // 启用的性能项目
+  perfOverlayBgOpacity?: number;     // 背景透明度 (0.0-1.0)
+}
+
+/**
+ * 高级设置
+ */
+export interface AdvancedSettings {
+  decoderBufferCount: number;
+  enableSyncDecode: boolean;  // 同步解码模式（API 20+，减少回调延迟）
+  enableVrr: boolean;  // VRR 可变刷新率模式
+  latencyToast: boolean;
+  disableWarnings: boolean;
+  enableStun: boolean;
+  enableEscMenu: boolean;
+  escMenuKey: string;
+  performanceMode: boolean;  // 性能模式：优化线程优先级和系统资源
+}
+
+/**
+ * 音频设置
+ */
+export interface AudioSettings {
+  audioConfig: string;
+  enableLocalAudio: boolean;
+  enableSpatializer: boolean;
+  controlOnly: boolean;
+  enableMic: boolean;
+  micBitrate: number;
+  audioCompatMode: boolean;
+}
+
+/**
+ * 分辨率接口
+ */
+interface Resolution {
+  width: number;
+  height: number;
+}
+
+/**
+ * 设置服务单例
+ */
+export class SettingsService {
+  private static instance: SettingsService | null = null;
+
+  private constructor() {}
+
+  static getInstance(): SettingsService {
+    if (!SettingsService.instance) {
+      SettingsService.instance = new SettingsService();
+    }
+    return SettingsService.instance;
+  }
+
+  /**
+   * 解析分辨率字符串
+   * 支持预设格式(如 "1080p", "4K")和自定义格式(如 "2560x1080")
+   */
+  private parseResolution(resolutionStr: string): Resolution {
+    // 本机分辨率：动态获取当前屏幕分辨率
+    if (resolutionStr === 'native') {
+      try {
+        const displayInfo = display.getDefaultDisplaySync();
+        const w = displayInfo.width;
+        const h = displayInfo.height;
+        // 始终横屏格式
+        return w >= h
+          ? { width: w, height: h } as Resolution
+          : { width: h, height: w } as Resolution;
+      } catch (_e) {
+        return { width: 1920, height: 1080 } as Resolution;
+      }
+    }
+    // 预设分辨率
+    switch (resolutionStr) {
+      case '720p':
+        return { width: 1280, height: 720 } as Resolution;
+      case '1080p':
+        return { width: 1920, height: 1080 } as Resolution;
+      case '1440p':
+        return { width: 2560, height: 1440 } as Resolution;
+      case '4K':
+        return { width: 3840, height: 2160 } as Resolution;
+      case '360p':
+        return { width: 640, height: 360 } as Resolution;
+      case '480p':
+        return { width: 854, height: 480 } as Resolution;
+    }
+    
+    // 尝试解析自定义格式: WIDTHxHEIGHT
+    const match = resolutionStr.match(/^(\d+)x(\d+)$/);
+    if (match) {
+      const width = parseInt(match[1]);
+      const height = parseInt(match[2]);
+      if (width >= 320 && width <= 7680 && height >= 240 && height <= 4320) {
+        return { width, height } as Resolution;
+      }
+    }
+    
+    // 默认 1080p
+    return { width: 1920, height: 1080 } as Resolution;
+  }
+
+  /**
+   * 解析帧率字符串
+   */
+  private parseFps(fpsStr: string): number {
+    // 检查是否是自定义帧率
+    if (fpsStr.startsWith('自定义:')) {
+      const customFps = parseInt(fpsStr.split(':')[1]);
+      return isNaN(customFps) ? 60 : customFps;
+    }
+    
+    switch (fpsStr) {
+      case '30 FPS':
+        return 30;
+      case '60 FPS':
+        return 60;
+      case '90 FPS':
+        return 90;
+      case '119.88 FPS':
+        return 120; // 使用 120 作为 fps，实际帧率由 clientRefreshRateX100 控制
+      case '120 FPS':
+        return 120;
+      case '144 FPS':
+        return 144;
+      default: {
+        // 支持动态检测的设备刷新率（如 "165 FPS"）
+        const parsed = parseInt(fpsStr);
+        return isNaN(parsed) ? 60 : parsed;
+      }
+    }
+  }
+
+  /**
+   * 解析帧率字符串并返回 clientRefreshRateX100
+   * 用于 NTSC 帧率支持 (如 119.88 Hz)
+   */
+  private parseClientRefreshRateX100(fpsStr: string): number {
+    // 检查是否是自定义帧率
+    if (fpsStr.startsWith('自定义:')) {
+      const customFps = parseInt(fpsStr.split(':')[1]);
+      return isNaN(customFps) ? 6000 : customFps * 100;
+    }
+    
+    switch (fpsStr) {
+      case '30 FPS':
+        return 3000;
+      case '60 FPS':
+        return 6000;
+      case '90 FPS':
+        return 9000;
+      case '119.88 FPS':
+        return 11988;  // NTSC 标准: 120000/1001 ≈ 119.88 Hz
+      case '120 FPS':
+        return 12000;
+      case '144 FPS':
+        return 14400;
+      default: {
+        // 支持动态检测的设备刷新率（如 "165 FPS"）
+        const parsed = parseInt(fpsStr);
+        return isNaN(parsed) ? 6000 : parsed * 100;
+      }
+    }
+  }
+
+  /**
+   * 解析音频配置字符串
+   */
+  private parseAudioConfig(configStr: string): AudioConfiguration {
+    switch (configStr) {
+      case '立体声':
+        return AudioConfiguration.STEREO;
+      case '5.1 环绕声':
+        return AudioConfiguration.SURROUND_51;
+      case '7.1 环绕声':
+        return AudioConfiguration.SURROUND_71;
+      default:
+        return AudioConfiguration.STEREO;
+    }
+  }
+
+  /**
+   * 解析视频编码格式
+   */
+  private parseVideoFormat(formatStr: string): 'H.264' | 'HEVC' {
+    switch (formatStr) {
+      case '自动':
+      case 'HEVC (H.265)':
+        return 'HEVC';
+      case 'H.264':
+        return 'H.264';
+      default:
+        return 'HEVC';
+    }
+  }
+
+  /**
+   * 解析屏幕组合模式
+   */
+  private parseScreenCombinationMode(modeStr: string): ScreenCombinationMode {
+    switch (modeStr) {
+      case '主机默认':
+        return ScreenCombinationMode.HOST_DEFAULT;
+      case '不修改':
+        return ScreenCombinationMode.NO_OPERATION;
+      case '确保开启':
+        return ScreenCombinationMode.ENSURE_ACTIVE;
+      case '设为主屏':
+        return ScreenCombinationMode.ENSURE_PRIMARY;
+      case '仅此屏幕':
+        return ScreenCombinationMode.ENSURE_ONLY_DISPLAY;
+      default:
+        return ScreenCombinationMode.HOST_DEFAULT;
+    }
+  }
+
+  /**
+   * 解析性能覆盖层方向
+   */
+  private parsePerfOverlayOrientation(orientationStr: string): PerfOverlayOrientation {
+    switch (orientationStr) {
+      case '水平':
+        return PerfOverlayOrientation.HORIZONTAL;
+      case '垂直':
+        return PerfOverlayOrientation.VERTICAL;
+      default:
+        return PerfOverlayOrientation.HORIZONTAL;
+    }
+  }
+
+  /**
+   * 解析性能覆盖层位置
+   */
+  private parsePerfOverlayPosition(positionStr: string): PerfOverlayPosition {
+    switch (positionStr) {
+      case '顶部':
+        return PerfOverlayPosition.TOP;
+      case '底部':
+        return PerfOverlayPosition.BOTTOM;
+      case '左上角':
+        return PerfOverlayPosition.TOP_LEFT;
+      case '右上角':
+        return PerfOverlayPosition.TOP_RIGHT;
+      case '左下角':
+        return PerfOverlayPosition.BOTTOM_LEFT;
+      case '右下角':
+        return PerfOverlayPosition.BOTTOM_RIGHT;
+      default:
+        return PerfOverlayPosition.TOP;
+    }
+  }
+
+  /**
+   * 获取布尔值设置
+   */
+  private async getBoolean(key: string, defaultValue: boolean): Promise<boolean> {
+    const value = await PreferencesUtil.get<string | boolean>(key, defaultValue.toString());
+    if (typeof value === 'boolean') {
+      return value;
+    }
+    return value === 'true';
+  }
+
+  /**
+   * 获取数值设置
+   */
+  private async getNumber(key: string, defaultValue: number): Promise<number> {
+    const value = await PreferencesUtil.get<number | string>(key, defaultValue.toString());
+    if (typeof value === 'number') {
+      return Number.isFinite(value) ? value : defaultValue;
+    }
+    const trimmedValue = value.trim();
+    if (trimmedValue.length === 0) {
+      return defaultValue;
+    }
+    const parsed = Number(trimmedValue);
+    return Number.isFinite(parsed) ? parsed : defaultValue;
+  }
+
+  /**
+   * 获取字符串设置
+   */
+  private async getString(key: string, defaultValue: string): Promise<string> {
+    return await PreferencesUtil.get<string>(key, defaultValue);
+  }
+
+  /**
+   * 从设置生成 StreamConfig
+   */
+  async getStreamConfig(): Promise<StreamConfig> {
+    // 获取基础视频设置
+    // 默认跟随平板本机分辨率：不写死 1080p，避免画面被拉伸/留黑边
+    const resolutionStr = await this.getString(SettingsKeys.RESOLUTION, 'native');
+    const fpsStr = await this.getString(SettingsKeys.FPS, '60 FPS');
+    const bitrateRaw = await this.getNumber(SettingsKeys.BITRATE, 0);  // 默认 0 表示自动计算
+    const hostScale = await this.getNumber(SettingsKeys.HOST_SCALE, 100);
+    const enableHdr = await this.getBoolean(SettingsKeys.ENABLE_HDR, false);
+    const hdrModeStr = await this.getString(SettingsKeys.HDR_MODE, 'HDR10');
+    const videoFormatStr = await this.getString(SettingsKeys.VIDEO_FORMAT, '自动');
+    const fullRange = await this.getBoolean(SettingsKeys.FULL_RANGE, false);
+    const reverseResolution = await this.getBoolean(SettingsKeys.REVERSE_RESOLUTION, false);
+
+    // 解析分辨率和帧率
+    let resolution: Resolution = this.parseResolution(resolutionStr);
+    const fps = this.parseFps(fpsStr);
+
+    // 应用分辨率缩放
+    if (hostScale !== 100) {
+      const scaledWidth = Math.round(resolution.width * hostScale / 100);
+      const scaledHeight = Math.round(resolution.height * hostScale / 100);
+      resolution = { width: scaledWidth, height: scaledHeight } as Resolution;
+    }
+
+    // 反转分辨率
+    if (reverseResolution) {
+      const temp = resolution.width;
+      resolution.width = resolution.height;
+      resolution.height = temp;
+    }
+
+    // 计算码率（Mbps -> Kbps）
+    let bitrate = bitrateRaw * 1000;
+    if (bitrateRaw <= 0) {
+      // 如果码率设置为 0 或无效，使用推荐值
+      bitrate = getRecommendedBitrate(resolution.width, resolution.height, fps);
+    }
+
+    // 获取音频设置
+    const audioConfigStr = await this.getString(SettingsKeys.AUDIO_CONFIG, '立体声');
+    const enableLocalAudio = await this.getBoolean(SettingsKeys.ENABLE_LOCAL_AUDIO, false);
+    const developerMode = await this.getBoolean(SettingsKeys.DEVELOPER_MODE, false);
+    const enableMic = developerMode && await this.getBoolean(SettingsKeys.ENABLE_MIC, false);  // 非开发者模式下强制禁用
+    const micBitrate = await this.getNumber(SettingsKeys.MIC_BITRATE, 64);
+    const controlOnly = await this.getBoolean(SettingsKeys.CONTROL_ONLY, false);
+    const enableSpatializer = await this.getBoolean(SettingsKeys.ENABLE_SPATIALIZER, false);
+    const audioCompatMode = await this.getBoolean(SettingsKeys.AUDIO_COMPAT_MODE, false);
+
+    // 获取主机设置
+    const enableSops = await this.getBoolean(SettingsKeys.ENABLE_SOPS, true);
+    const multiController = await this.getBoolean(SettingsKeys.MULTI_CONTROLLER, true);
+    const lockScreenAfterDisconnect = await this.getBoolean(SettingsKeys.LOCK_SCREEN_AFTER_DISCONNECT, false);
+    const screenCombinationModeStr = await this.getString(SettingsKeys.SCREEN_COMBINATION_MODE, '主机默认');
+    // 隐私屏开启时，无论屏幕组合模式手动选了什么，一律强制「仅此屏」
+    const privacyScreenEnabled = await this.getBoolean(SettingsKeys.PRIVACY_SCREEN_ENABLED, false);
+
+    // 获取输入设置
+    const enableVibration = await this.getBoolean(SettingsKeys.ENABLE_VIBRATION, true);
+    const vibrationMode = await this.getString(SettingsKeys.VIBRATION_MODE, '自动');
+    const gameVibrationStrength = normalizeGameVibrationStrength(
+      await this.getNumber(SettingsKeys.VIBRATE_FALLBACK_STRENGTH, GAME_VIBRATION_STRENGTH_DEFAULT)
+    );
+    const enableAudioVibration = await this.getBoolean(SettingsKeys.ENABLE_AUDIO_VIBRATION, false);
+    const audioVibrationStrength = await this.getNumber(SettingsKeys.AUDIO_VIBRATION_STRENGTH, 60);
+    const audioVibrationSceneMode = await this.getString(SettingsKeys.AUDIO_VIBRATION_SCENE_MODE, '游戏/电影');
+    const deadzone = await this.getNumber(SettingsKeys.DEADZONE, 7);
+    const flipFaceButtons = await this.getBoolean(SettingsKeys.FLIP_FACE_BUTTONS, false);
+
+    // 获取鼠标/触控设置
+    const showLocalCursor = await this.getBoolean(SettingsKeys.SHOW_LOCAL_CURSOR, false);  // 默认不显示本地光标
+    const touchscreenTrackpad = await this.getBoolean(SettingsKeys.TOUCHSCREEN_TRACKPAD, false);
+    const lowLatencyTouch = await this.getBoolean(SettingsKeys.LOW_LATENCY_TOUCH, false);
+    const enableDoubleClickDrag = await this.getBoolean(SettingsKeys.ENABLE_DOUBLE_CLICK_DRAG, false);
+    const doubleTapTimeThreshold = await this.getNumber(SettingsKeys.DOUBLE_TAP_TIME_THRESHOLD, 125);
+
+    // 获取增强触控设置
+    const enableEnhancedTouch = await this.getBoolean(SettingsKeys.ENABLE_ENHANCED_TOUCH, true);
+    const enhancedTouchOnRight = await this.getBoolean(SettingsKeys.ENHANCED_TOUCH_ON_RIGHT, false);
+    const enhancedTouchZoneDivider = await this.getNumber(SettingsKeys.ENHANCED_TOUCH_ZONE_DIVIDER, 50);
+    const pointerVelocityFactor = await this.getNumber(SettingsKeys.POINTER_VELOCITY_FACTOR, 100);
+    const longPressFlatRegion = await this.getNumber(SettingsKeys.LONG_PRESS_FLAT_REGION, 0);
+
+    // 获取高级设置
+    const decoderBufferCount = await this.getNumber(SettingsKeys.DECODER_BUFFER_COUNT, 0);
+    const enableSyncDecode = await this.getBoolean(SettingsKeys.ENABLE_SYNC_DECODE, false);  // 默认禁用
+    const enableVrr = await this.getBoolean(SettingsKeys.ENABLE_VRR, false);  // VRR 默认禁用
+    const enableVsync = await this.getBoolean(SettingsKeys.ENABLE_VSYNC, false);
+    const enableHostPacedPresentation = await this.getBoolean(
+      SettingsKeys.ENABLE_HOST_PACED_PRESENTATION, true);
+    const enablePostProcess = await this.getBoolean(SettingsKeys.ENABLE_POST_PROCESS, false);
+    const upscaleMode = await this.getNumber(SettingsKeys.UPSCALE_MODE, 0);
+    const upscaleSharpness = await this.getNumber(SettingsKeys.UPSCALE_SHARPNESS, 50) / 100.0;
+    // HDR 增强模式：优先读新的三档枚举；若未设置则从旧布尔值派生（true→自研shader, false→关闭）
+    const legacySdrToHdr = await this.getBoolean(SettingsKeys.SDR_TO_HDR, false);
+    const sdrToHdrMode = await this.getNumber(SettingsKeys.SDR_TO_HDR_MODE, legacySdrToHdr ? 1 : 0);
+    const sdrToHdr = (sdrToHdrMode === 1);
+    const sdrToHdrPeakNits = await this.getNumber(SettingsKeys.SDR_TO_HDR_PEAK_NITS, 500);
+    const sdrToHdrSaturation = await this.getNumber(SettingsKeys.SDR_TO_HDR_SATURATION, 130) / 100.0;
+    const sdrToHdrContrast = await this.getNumber(SettingsKeys.SDR_TO_HDR_CONTRAST, 100) / 100.0;
+    const enableStun = await this.getBoolean(SettingsKeys.ENABLE_STUN, false);
+    const stretchVideo = await this.getBoolean(SettingsKeys.STRETCH_VIDEO, false);
+    const hdrHighBrightness = await this.getBoolean(SettingsKeys.ENABLE_HDR_HIGH_BRIGHTNESS, false);
+    const hdrBrightnessOverride = await this.getBoolean(SettingsKeys.HDR_BRIGHTNESS_OVERRIDE, false);
+    const hdrPeakBrightnessNits = Math.max(300, Math.min(4000,
+      await this.getNumber(SettingsKeys.HDR_PEAK_BRIGHTNESS_NITS, 1000)));
+
+    // 获取显示设置
+    const enablePerfOverlay = await this.getBoolean(SettingsKeys.ENABLE_PERF_OVERLAY, false);
+    const perfOverlayOrientationStr = await this.getString(SettingsKeys.PERF_OVERLAY_ORIENTATION, '垂直');
+    const perfOverlayPositionStr = await this.getString(SettingsKeys.PERF_OVERLAY_POSITION, '右上角');
+    const enableOnscreenControls = await this.getBoolean(SettingsKeys.ENABLE_ONSCREEN_CONTROLS, false);
+    const oscOpacity = await this.getNumber(SettingsKeys.OSC_OPACITY, 90);
+    const enableEscMenu = await this.getBoolean(SettingsKeys.ENABLE_ESC_MENU, true);
+
+    // 构建 StreamConfig
+    const config: StreamConfig = {
+      // 视频设置
+      width: resolution.width,
+      height: resolution.height,
+      fps: fps,
+      clientRefreshRateX100: this.parseClientRefreshRateX100(fpsStr),
+      bitrate: bitrate,
+      codec: this.parseVideoFormat(videoFormatStr),
+      hdr: enableHdr,
+      hdrMode: hdrModeStr === 'HLG' ? HdrMode.HLG : HdrMode.HDR10,
+      hdrHighBrightness: hdrHighBrightness,
+      hdrBrightnessOverride: hdrBrightnessOverride,
+      hdrPeakBrightnessNits: hdrPeakBrightnessNits,
+      stretchVideo: stretchVideo,
+
+      // 音频设置
+      audioEnabled: !controlOnly,
+      controlOnly: controlOnly,
+      microphoneEnabled: enableMic,
+      micBitrate: micBitrate,
+      audioConfig: this.parseAudioConfig(audioConfigStr),
+      enableSpatializer: enableSpatializer,
+      audioCompatMode: audioCompatMode,
+
+      // 主机设置
+      sops: enableSops,
+      playLocalAudio: enableLocalAudio,
+      // 隐私屏：强制虚拟显示器独占（物理屏全黑）
+      screenCombinationMode: privacyScreenEnabled
+        ? ScreenCombinationMode.ENSURE_ONLY_DISPLAY
+        : this.parseScreenCombinationMode(screenCombinationModeStr),
+      lockScreenAfterDisconnect: lockScreenAfterDisconnect,
+
+      // 输入设置
+      multiController: multiController,
+      attachedGamepadMask: 0,
+      enableVibration: enableVibration,
+      vibrationMode: vibrationMode,
+      gameVibrationStrength: gameVibrationStrength,
+      enableAudioVibration: enableAudioVibration,
+      audioVibrationStrength: audioVibrationStrength,
+      audioVibrationSceneMode: audioVibrationSceneMode,
+      deadzone: deadzone,
+      flipFaceButtons: flipFaceButtons,
+
+      // 鼠标/触控设置
+      showLocalCursor: showLocalCursor,
+      touchscreenTrackpad: touchscreenTrackpad,
+      lowLatencyTouch: lowLatencyTouch,
+      enableDoubleClickDrag: enableDoubleClickDrag,
+      doubleTapTimeThreshold: doubleTapTimeThreshold,
+
+      // 增强触控设置
+      enableEnhancedTouch: enableEnhancedTouch,
+      enhancedTouchOnRight: enhancedTouchOnRight,
+      enhancedTouchZoneDivider: enhancedTouchZoneDivider,
+      pointerVelocityFactor: pointerVelocityFactor,
+      longPressFlatRegion: longPressFlatRegion,
+
+      // 高级选项
+      packetSize: 1024,
+      encryptionFlags: 0,
+      colorRange: fullRange ? ColorRange.FULL : ColorRange.LIMITED,
+      decoderBufferCount: decoderBufferCount,
+      enableSyncDecode: enableSyncDecode,
+      enableVrr: enableVrr,
+      enableVsync: enableVsync,
+      enableHostPacedPresentation: enableHostPacedPresentation,
+      enablePostProcess: enablePostProcess,
+      sdrToHdrMode: sdrToHdrMode,
+      sdrToHdr: sdrToHdr,
+      sdrToHdrPeakNits: sdrToHdrPeakNits,
+      sdrToHdrSaturation: sdrToHdrSaturation,
+      sdrToHdrContrast: sdrToHdrContrast,
+      upscaleMode: upscaleMode,
+      upscaleSharpness: upscaleSharpness,
+      enableStun: enableStun,
+      performanceMode: await this.getBoolean(SettingsKeys.PERFORMANCE_MODE, false),
+
+      // 运行时选项
+      remote: RemoteConfig.AUTO,
+
+      // 显示选项
+      showPerfOverlay: enablePerfOverlay,
+      perfOverlayOrientation: this.parsePerfOverlayOrientation(perfOverlayOrientationStr),
+      perfOverlayPosition: this.parsePerfOverlayPosition(perfOverlayPositionStr),
+      showOnscreenControls: enableOnscreenControls,
+      onscreenControlsOpacity: oscOpacity,
+      enableEscMenu: enableEscMenu
+    };
+
+    return config;
+  }
+
+  /**
+   * 获取输入设置
+   */
+  async getInputSettings(): Promise<InputSettings> {
+    return {
+      // 手柄
+      enableVibration: await this.getBoolean(SettingsKeys.ENABLE_VIBRATION, true),
+      vibrationMode: await this.getString(SettingsKeys.VIBRATION_MODE, '自动'),
+      gameVibrationStrength: normalizeGameVibrationStrength(
+        await this.getNumber(SettingsKeys.VIBRATE_FALLBACK_STRENGTH, GAME_VIBRATION_STRENGTH_DEFAULT)
+      ),
+      enableAudioVibration: await this.getBoolean(SettingsKeys.ENABLE_AUDIO_VIBRATION, false),
+      audioVibrationStrength: await this.getNumber(SettingsKeys.AUDIO_VIBRATION_STRENGTH, 60),
+      audioVibrationSceneMode: await this.getString(SettingsKeys.AUDIO_VIBRATION_SCENE_MODE, '游戏/电影'),
+      multiController: await this.getBoolean(SettingsKeys.MULTI_CONTROLLER, true),
+      flipFaceButtons: await this.getBoolean(SettingsKeys.FLIP_FACE_BUTTONS, false),
+      deadzone: await this.getNumber(SettingsKeys.DEADZONE, 7),
+      gamepadMotionSensors: await this.getBoolean(SettingsKeys.GAMEPAD_MOTION_SENSORS, true),
+      gamepadMotionFallback: await this.getBoolean(SettingsKeys.GAMEPAD_MOTION_FALLBACK, false),
+      gamepadTouchpadMouse: await this.getBoolean(SettingsKeys.GAMEPAD_TOUCHPAD_MOUSE, false),
+      enableStartKeyMenu: await this.getBoolean(SettingsKeys.ENABLE_START_KEY_MENU, true),
+      enableKeyInterceptor: await this.getBoolean(SettingsKeys.ENABLE_KEY_INTERCEPTOR, false),
+      usbDriverEnabled: await this.getBoolean(SettingsKeys.USB_DRIVER_ENABLED, false),
+      forceUsbDriverOnly: await this.getBoolean(SettingsKeys.FORCE_USB_DRIVER_ONLY, false),
+      ddkHighSpeedPolling: await this.getBoolean(SettingsKeys.DDK_HIGH_SPEED_POLLING, false),
+      usbForwardingEnabled: await this.getBoolean(SettingsKeys.USB_FORWARDING_ENABLED, false),
+
+      // 体感助手
+      gyroAssistEnabled: await this.getBoolean(SettingsKeys.GYRO_ASSIST_ENABLED, false),
+      gyroSensitivity: await this.getNumber(SettingsKeys.GYRO_SENSITIVITY, 1.0),
+      gyroInvertX: await this.getBoolean(SettingsKeys.GYRO_INVERT_X, false),
+      gyroInvertY: await this.getBoolean(SettingsKeys.GYRO_INVERT_Y, false),
+      gyroActivationKey: await this.getNumber(SettingsKeys.GYRO_ACTIVATION_KEY, -1),
+      showGyroCard: await this.getBoolean(SettingsKeys.SHOW_GYRO_CARD, true),
+
+      // 屏幕控制器
+      enableOnscreenControls: await this.getBoolean(SettingsKeys.ENABLE_ONSCREEN_CONTROLS, false),
+      enableOnscreenKeyboard: await this.getBoolean(SettingsKeys.ENABLE_ONSCREEN_KEYBOARD, false),
+      onlyL3R3: await this.getBoolean(SettingsKeys.ONLY_L3_R3, false),
+      showGuideButton: await this.getBoolean(SettingsKeys.SHOW_GUIDE_BUTTON, true),
+      halfHeightOscPortrait: await this.getBoolean(SettingsKeys.HALF_HEIGHT_OSC_PORTRAIT, true),
+      oscOpacity: await this.getNumber(SettingsKeys.OSC_OPACITY, 90),
+      vibrateOsc: await this.getBoolean(SettingsKeys.VIBRATE_OSC, true),
+
+      // 鼠标/触控
+      showLocalCursor: await this.getBoolean(SettingsKeys.SHOW_LOCAL_CURSOR, false),
+      touchscreenTrackpad: await this.getBoolean(SettingsKeys.TOUCHSCREEN_TRACKPAD, false),
+      enableThreeFingerIme: await this.getBoolean(SettingsKeys.ENABLE_THREE_FINGER_IME, true),
+      lowLatencyTouch: await this.getBoolean(SettingsKeys.LOW_LATENCY_TOUCH, false),
+      enableDoubleClickDrag: await this.getBoolean(SettingsKeys.ENABLE_DOUBLE_CLICK_DRAG, false),
+      doubleTapTimeThreshold: await this.getNumber(SettingsKeys.DOUBLE_TAP_TIME_THRESHOLD, 125),
+      mouseNavButtons: await this.getBoolean(SettingsKeys.MOUSE_NAV_BUTTONS, false),
+      gameMouseMode: await this.getBoolean(SettingsKeys.GAME_MOUSE_MODE, false),
+
+      // 增强触控
+      enableEnhancedTouch: await this.getBoolean(SettingsKeys.ENABLE_ENHANCED_TOUCH, true),
+      enhancedTouchOnRight: await this.getBoolean(SettingsKeys.ENHANCED_TOUCH_ON_RIGHT, false),
+      enhancedTouchZoneDivider: await this.getNumber(SettingsKeys.ENHANCED_TOUCH_ZONE_DIVIDER, 50),
+      pointerVelocityFactor: await this.getNumber(SettingsKeys.POINTER_VELOCITY_FACTOR, 100),
+      longPressFlatRegion: await this.getNumber(SettingsKeys.LONG_PRESS_FLAT_REGION, 0)
+    };
+  }
+
+  /**
+   * 获取主机设置
+   */
+  async getHostSettings(): Promise<HostSettings> {
+    return {
+      enableSops: await this.getBoolean(SettingsKeys.ENABLE_SOPS, true),
+      screenCombinationMode: await this.getString(SettingsKeys.SCREEN_COMBINATION_MODE, '主机默认'),
+      lockScreenAfterDisconnect: await this.getBoolean(SettingsKeys.LOCK_SCREEN_AFTER_DISCONNECT, false)
+    };
+  }
+
+  /**
+   * 获取显示设置
+   */
+  async getDisplaySettings(): Promise<DisplaySettings> {
+    const itemsStr = await this.getString(SettingsKeys.PERF_OVERLAY_ITEMS, 'resolution,decoder,render_fps,packet_loss,bitrate,network_latency,decode_latency');
+    const items = itemsStr.split(',').filter(item => item.length > 0);
+    const hdrPeakBrightnessNits = Math.max(300, Math.min(4000,
+      await this.getNumber(SettingsKeys.HDR_PEAK_BRIGHTNESS_NITS, 1000)));
+    
+    return {
+      stretchVideo: await this.getBoolean(SettingsKeys.STRETCH_VIDEO, false),
+      reverseResolution: await this.getBoolean(SettingsKeys.REVERSE_RESOLUTION, false),
+      rotableScreen: await this.getBoolean(SettingsKeys.ROTABLE_SCREEN, false),
+      enableHdrHighBrightness: await this.getBoolean(SettingsKeys.ENABLE_HDR_HIGH_BRIGHTNESS, false),
+      hdrBrightnessOverride: await this.getBoolean(SettingsKeys.HDR_BRIGHTNESS_OVERRIDE, false),
+      hdrPeakBrightnessNits: hdrPeakBrightnessNits,
+      screenPosition: await this.getString(SettingsKeys.SCREEN_POSITION, '居中'),
+      screenOffsetX: await this.getNumber(SettingsKeys.SCREEN_OFFSET_X, 0),
+      screenOffsetY: await this.getNumber(SettingsKeys.SCREEN_OFFSET_Y, 0),
+      enablePerfOverlay: await this.getBoolean(SettingsKeys.ENABLE_PERF_OVERLAY, false),
+      perfOverlayOrientation: await this.getString(SettingsKeys.PERF_OVERLAY_ORIENTATION, '垂直'),
+      perfOverlayPosition: await this.getString(SettingsKeys.PERF_OVERLAY_POSITION, '右上角'),
+      perfOverlayLocked: await this.getBoolean(SettingsKeys.PERF_OVERLAY_LOCKED, false),
+      perfOverlayItems: items,
+      perfOverlayBgOpacity: await this.getNumber(SettingsKeys.PERF_OVERLAY_BG_OPACITY, 0.53)
+    };
+  }
+
+  /**
+   * 获取高级设置
+   */
+  async getAdvancedSettings(): Promise<AdvancedSettings> {
+    return {
+      decoderBufferCount: await this.getNumber(SettingsKeys.DECODER_BUFFER_COUNT, 0),
+      enableSyncDecode: await this.getBoolean(SettingsKeys.ENABLE_SYNC_DECODE, false),  // 默认禁用
+      enableVrr: await this.getBoolean(SettingsKeys.ENABLE_VRR, false),  // VRR 默认禁用
+      latencyToast: await this.getBoolean(SettingsKeys.LATENCY_TOAST, false),
+      disableWarnings: await this.getBoolean(SettingsKeys.DISABLE_WARNINGS, false),
+      enableStun: await this.getBoolean(SettingsKeys.ENABLE_STUN, false),
+      enableEscMenu: await this.getBoolean(SettingsKeys.ENABLE_ESC_MENU, true),
+      escMenuKey: await this.getString(SettingsKeys.ESC_MENU_KEY, 'ESC'),
+      performanceMode: await this.getBoolean(SettingsKeys.PERFORMANCE_MODE, false)  // 性能模式默认禁用
+    };
+  }
+
+  /**
+   * 获取音频设置
+   */
+  async getAudioSettings(): Promise<AudioSettings> {
+    return {
+      audioConfig: await this.getString(SettingsKeys.AUDIO_CONFIG, '立体声'),
+      enableLocalAudio: await this.getBoolean(SettingsKeys.ENABLE_LOCAL_AUDIO, false),
+      enableSpatializer: await this.getBoolean(SettingsKeys.ENABLE_SPATIALIZER, false),
+      controlOnly: await this.getBoolean(SettingsKeys.CONTROL_ONLY, false),
+      enableMic: await this.getBoolean(SettingsKeys.ENABLE_MIC, false),
+      micBitrate: await this.getNumber(SettingsKeys.MIC_BITRATE, 64),
+      audioCompatMode: await this.getBoolean(SettingsKeys.AUDIO_COMPAT_MODE, false)
+    };
+  }
+
+  /**
+   * 是否显示性能覆盖层
+   */
+  async shouldShowPerfOverlay(): Promise<boolean> {
+    return await this.getBoolean(SettingsKeys.ENABLE_PERF_OVERLAY, false);
+  }
+
+  /**
+   * 是否显示屏幕控制器
+   */
+  async shouldShowOnscreenControls(): Promise<boolean> {
+    return await this.getBoolean(SettingsKeys.ENABLE_ONSCREEN_CONTROLS, false);
+  }
+
+  /**
+   * 获取屏幕控制器透明度
+   */
+  async getOscOpacity(): Promise<number> {
+    return await this.getNumber(SettingsKeys.OSC_OPACITY, 90);
+  }
+
+  /**
+   * 是否恢复上次串流
+   */
+  async shouldResumeStream(): Promise<boolean> {
+    return await this.getBoolean(SettingsKeys.RESUME_STREAM, false);
+  }
+
+  async getBandwidthProbeSettings(): Promise<BandwidthProbeSettings> {
+    return {
+      probeEnabled: await this.getBoolean(SettingsKeys.BANDWIDTH_PROBE_ENABLED, false),
+      meteredProbeEnabled: await this.getBoolean(SettingsKeys.METERED_BANDWIDTH_PROBE_ENABLED, false)
+    };
+  }
+
+}
+
+/**
+ * UI 偏好（跨页面响应式同步）
+ *
+ * 设计：持久化层 PreferencesUtil + 运行时层 AppStorage
+ * - `init()` 在 EntryAbility 启动时调用一次，把磁盘值灌入 AppStorage
+ * - 各页面用 `@StorageLink('smallIconMode')` 订阅，任意一处写入立即广播
+ * - `setSmallIconMode(v)` 同步更新 AppStorage + 磁盘
+ */
+export class UiSettings {
+  /** AppStorage 键名（需与 @StorageLink('smallIconMode') 保持一致） */
+  static readonly SMALL_ICON_MODE_KEY: string = 'smallIconMode';
+
+  static async init(): Promise<void> {
+    let value = false;
+    try {
+      value = await PreferencesUtil.get<boolean>(SettingsKeys.SMALL_ICON_MODE, false);
+    } catch (_) {
+      value = false;
+    }
+    AppStorage.setOrCreate<boolean>(UiSettings.SMALL_ICON_MODE_KEY, value);
+  }
+
+  static getSmallIconMode(): boolean {
+    const v = AppStorage.get<boolean>(UiSettings.SMALL_ICON_MODE_KEY);
+    return v === true;
+  }
+
+  static async setSmallIconMode(next: boolean): Promise<void> {
+    AppStorage.setOrCreate<boolean>(UiSettings.SMALL_ICON_MODE_KEY, next);
+    try {
+      await PreferencesUtil.put(SettingsKeys.SMALL_ICON_MODE, next);
+    } catch (_) {
+      // 持久化失败不回滚内存态：保持 UI 反馈一致
+    }
+  }
+
+  static async toggleSmallIconMode(): Promise<boolean> {
+    const next = !UiSettings.getSmallIconMode();
+    await UiSettings.setSmallIconMode(next);
+    return next;
+  }
+}

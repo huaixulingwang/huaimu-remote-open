@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240" width="240" height="240" fill="none" role="img" aria-label="这次失败">
+  <title>串流报告 · 失败</title>
+  <desc>折线断成两截，终点是一个空着的环。环空着，就是还没到。</desc>
+  <path d="M44 140 L92 108" stroke="#6B7672" stroke-width="14" stroke-linecap="round"/>
+  <path d="M136 164 L186 154" stroke="#6B7672" stroke-width="14" stroke-linecap="round"/>
+  <circle cx="204" cy="152" r="18" stroke="#6B7672" stroke-width="10"/>
+</svg>

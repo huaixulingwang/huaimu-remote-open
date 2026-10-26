@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240" width="240" height="240" fill="none" role="img" aria-label="这次一般">
+  <title>串流报告 · 一般</title>
+  <desc>一条起伏平缓的折线，终点是一个中等大小的实心点。路走通了，但没往上走。</desc>
+  <path d="M44 132 L88 144 L128 124 L172 138 L204 130" stroke="#4FB894" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="204" cy="130" r="17" fill="#4FB894"/>
+</svg>

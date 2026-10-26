@@ -1,0 +1,29 @@
+# 第三方组件与来源声明（NOTICE）
+
+## 本项目来源
+
+本仓库是 **AlkaidLab/moonlight-harmony** 的非官方衍生版本，在其基础上增加了组网、隐私屏、账号与配对等内容。
+
+| 上游项目 | 许可证 | 说明 |
+|---|---|---|
+| [AlkaidLab/moonlight-harmony](https://github.com/AlkaidLab/moonlight-harmony) | GPL-3.0 | 鸿蒙原生串流客户端，本仓库的直接上游 |
+| [qiin2333/moonlight-vplus](https://github.com/qiin2333/moonlight-vplus) | GPL-3.0 | 上述项目的上游（Moonlight 增强版） |
+| [moonlight-stream/moonlight-common-c](https://github.com/moonlight-stream/moonlight-common-c) | GPL-3.0 | Moonlight 协议核心库（本项目使用 qiin2333 的分支，保留其版权声明） |
+
+上述项目的版权归各自作者所有，相关版权声明随源码保留，不得删除。
+
+## 其他第三方组件
+
+| 组件 | 许可证 | 用法 |
+|---|---|---|
+| ohos-openssl | Apache-2.0 | TLS 支持（子模块） |
+| EasyTier（easytier-ohrs） | LGPL-3.0 | 内置组网 |
+| libfvad | BSD-3-Clause | 音频触感中的语音活动检测 |
+
+## 授权关系
+
+- 本仓库中**由本项目新增/修改的部分**依 AGPL-3.0 授权；
+- 上游 GPL-3.0 部分仍适用 GPL-3.0，其版权与许可声明必须保留；
+- 合并后的作品整体按 AGPL-3.0 分发（依据 GPLv3 第 13 条：允许与 AGPLv3 作品合并分发）。
+
+若您是上述项目的权利人，认为本项目的分发方式不妥，请联系我们，我们会及时调整。
